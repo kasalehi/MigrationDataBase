@@ -78,6 +78,8 @@ LOCK_PATH = str(BASE_DIR / "entries.csv.lock")
 def get_engine() -> Engine:
     return create_engine(f"sqlite:///{DB_PATH.as_posix()}", future=True)
 
+# --- schema & integrity helpers ---
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entries (
   id TEXT PRIMARY KEY,
@@ -89,20 +91,71 @@ CREATE TABLE IF NOT EXISTS entries (
   migration_method TEXT,
   comment_sql TEXT
 );
--- Enforce uniqueness of the mapping (no duplicates)
-CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_mapping
-ON entries (
-  old_server, old_database, old_schema, old_table,
-  new_server, new_database, new_schema, new_table
-);
 """
+
+def dedupe_entries(engine: Engine) -> int:
+    """
+    Remove duplicate mappings, keeping the earliest created row per mapping.
+    Returns number of rows deleted.
+    """
+    # Delete everything that is not the MIN(created_at,id) within each mapping group
+    # (works on all modern SQLite versions)
+    sql = text("""
+        DELETE FROM entries
+        WHERE id NOT IN (
+            SELECT id FROM (
+                SELECT id
+                FROM entries e
+                JOIN (
+                    SELECT
+                        old_server, old_database, old_schema, old_table,
+                        new_server, new_database, new_schema, new_table,
+                        MIN(created_at) AS min_created
+                    FROM entries
+                    GROUP BY
+                        old_server, old_database, old_schema, old_table,
+                        new_server, new_database, new_schema, new_table
+                ) g
+                  ON e.old_server  = g.old_server
+                 AND e.old_database= g.old_database
+                 AND e.old_schema  = g.old_schema
+                 AND e.old_table   = g.old_table
+                 AND e.new_server  = g.new_server
+                 AND e.new_database= g.new_database
+                 AND e.new_schema  = g.new_schema
+                 AND e.new_table   = g.new_table
+                 AND e.created_at  = g.min_created
+            )
+        );
+    """)
+    with engine.begin() as conn:
+        res = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+        conn.execute(sql)
+        res2 = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+    return (res - res2)
 
 def ensure_db(engine: Engine) -> None:
     with engine.begin() as conn:
-        for stmt in SCHEMA_SQL.strip().split(";"):
-            s = stmt.strip()
-            if s:
-                conn.exec_driver_sql(s)
+        conn.exec_driver_sql(SCHEMA_SQL)
+
+    # 1) Dedupe existing rows before adding unique constraint
+    removed = dedupe_entries(engine)
+    if removed:
+        st.warning(f"Removed {removed} duplicate mapping(s) found in existing data.")
+
+    # 2) Now add the UNIQUE index (safe on clean data)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_mapping
+                ON entries (
+                  old_server, old_database, old_schema, old_table,
+                  new_server, new_database, new_schema, new_table
+                );
+            """)
+    except Exception as e:
+        # As a fallback, surface a helpful message
+        st.error(f"Failed to create unique index. Reason: {e}")
 
 def mapping_exists(engine: Engine, rec: dict) -> bool:
     sql = text("""
