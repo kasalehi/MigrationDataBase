@@ -130,34 +130,25 @@ def migrate_add_status(engine: Engine) -> None:
 
 def dedupe_entries(engine: Engine) -> int:
     """
-    Remove duplicate mappings, keeping the earliest created row per mapping.
+    Remove duplicates based ONLY on old_table name.
+    Keep the earliest created row (MIN(created_at)) per normalized old_table.
     Returns number of rows deleted.
     """
     sql = text("""
         DELETE FROM entries
         WHERE id NOT IN (
             SELECT id FROM (
-                SELECT id
+                SELECT e.id
                 FROM entries e
                 JOIN (
                     SELECT
-                        old_server, old_database, old_schema, old_table,
-                        new_server, new_database, new_schema, new_table,
-                        MIN(created_at) AS min_created
+                        LOWER(TRIM(old_table)) AS t_norm,
+                        MIN(created_at)        AS min_created
                     FROM entries
-                    GROUP BY
-                        old_server, old_database, old_schema, old_table,
-                        new_server, new_database, new_schema, new_table
+                    GROUP BY LOWER(TRIM(old_table))
                 ) g
-                  ON e.old_server  = g.old_server
-                 AND e.old_database= g.old_database
-                 AND e.old_schema  = g.old_schema
-                 AND e.old_table   = g.old_table
-                 AND e.new_server  = g.new_server
-                 AND e.new_database= g.new_database
-                 AND e.new_schema  = g.new_schema
-                 AND e.new_table   = g.new_table
-                 AND e.created_at  = g.min_created
+                  ON LOWER(TRIM(e.old_table)) = g.t_norm
+                 AND e.created_at             = g.min_created
             )
         );
     """)
@@ -167,43 +158,6 @@ def dedupe_entries(engine: Engine) -> int:
         after = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
     return (before - after)
 
-def ensure_db(engine: Engine) -> None:
-    with engine.begin() as conn:
-        conn.exec_driver_sql(SCHEMA_SQL)
-
-    # Migrate to ensure `status` exists and is populated
-    migrate_add_status(engine)
-
-    # Dedupe existing rows before adding unique constraint
-    removed = dedupe_entries(engine)
-    if removed:
-        st.warning(f"Removed {removed} duplicate mapping(s) found in existing data.")
-
-    # Add UNIQUE index (prevents future duplicates even under race)
-    try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_mapping
-                ON entries (
-                  old_server, old_database, old_schema, old_table,
-                  new_server, new_database, new_schema, new_table
-                );
-            """)
-    except Exception as e:
-        st.error(f"Failed to create unique index. Reason: {e}")
-
-def mapping_exists(engine: Engine, rec: dict) -> bool:
-    sql = text("""
-        SELECT 1 FROM entries
-        WHERE old_server=:old_server AND old_database=:old_database
-          AND old_schema=:old_schema AND old_table=:old_table
-          AND new_server=:new_server AND new_database=:new_database
-          AND new_schema=:new_schema AND new_table=:new_table
-        LIMIT 1
-    """)
-    with engine.begin() as conn:
-        row = conn.execute(sql, rec).fetchone()
-    return row is not None
 
 def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     """Returns (ok, message). Blocks duplicates."""
