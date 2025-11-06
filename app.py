@@ -17,6 +17,18 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from filelock import FileLock
 
+
+# --- Defaults for your environment ---
+SCHEMA_CHOICES     = ["dim", "dbo", "repo", "pbi", "mart"]
+DEFAULT_SCHEMA     = "dbo"
+
+OLD_SERVER_DEFAULT = r"LMNZLRPT001\LM_RPT"
+OLD_DB_DEFAULT     = "LesMills_Reporting"
+
+NEW_SERVER_DEFAULT = r"LMNZLREPORT01\LM_RPT"
+NEW_DB_DEFAULT     = "LesMills_Report"
+
+
 # -------- Simple password gate (single shared password) --------
 def _get_app_password() -> str:
     # Keep this in secrets/env in production; hardcoded here per your ask
@@ -301,13 +313,27 @@ engine = get_engine(); ensure_db(engine)
 with st.expander("➕ Add table move", expanded=True):
     with st.form("new_row"):
         dataset_report = st.text_input("Dataset/Report name *", placeholder="e.g., Customer (Service)")
-
         st.markdown("**Old (source)**")
         o1,o2,o3,o4 = st.columns(4)
-        old_server = o1.text_input("Old server", placeholder="LMNZLREPORT01\\LM_RPT")
-        old_db     = o2.text_input("Old database", placeholder="LMNZ_Report")
-        old_schema = o3.text_input("Old schema", value="dbo")
+        old_server = o1.text_input("Old server", value=OLD_SERVER_DEFAULT)
+        old_db     = o2.text_input("Old database", value=OLD_DB_DEFAULT)
+        old_schema = o3.selectbox(
+            "Old schema",
+            SCHEMA_CHOICES,
+            index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in SCHEMA_CHOICES else 0,
+        )
         old_table  = o4.text_input("Old table *", placeholder="Customer")
+
+        st.markdown("**New (target)**")
+        n1,n2,n3,n4 = st.columns(4)
+        new_server = n1.text_input("New server", value=NEW_SERVER_DEFAULT)
+        new_db     = n2.text_input("New database", value=NEW_DB_DEFAULT)
+        new_schema = n3.selectbox(
+            "New schema",
+            SCHEMA_CHOICES,
+            index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in SCHEMA_CHOICES else 0,
+        )
+        new_table  = n4.text_input("New table *", placeholder="Customer")
 
         st.markdown("**New (target)**")
         n1,n2,n3,n4 = st.columns(4)
@@ -395,16 +421,29 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
         rec = df.loc[df["id"]==rid].iloc[0].to_dict()
 
         cA,cB,cC,cD = st.columns(4)
-        rec["old_server"]  = cA.text_input("Old server", value=rec["old_server"])
-        rec["old_database"]= cB.text_input("Old database", value=rec["old_database"])
-        rec["old_schema"]  = cC.text_input("Old schema", value=rec["old_schema"])
-        rec["old_table"]   = cD.text_input("Old table", value=rec["old_table"])
+        rec["old_server"]   = cA.text_input("Old server", value=rec["old_server"])
+        rec["old_database"] = cB.text_input("Old database", value=rec["old_database"])
+        rec["old_schema"]   = cC.selectbox(
+            "Old schema",
+            SCHEMA_CHOICES,
+            index=SCHEMA_CHOICES.index(rec.get("old_schema", DEFAULT_SCHEMA))
+                if rec.get("old_schema", DEFAULT_SCHEMA) in SCHEMA_CHOICES else 0,
+            key=f"old_schema_{rid}",
+        )
+        rec["old_table"]    = cD.text_input("Old table", value=rec["old_table"])
 
         dA,dB,dC,dD = st.columns(4)
-        rec["new_server"]  = dA.text_input("New server", value=rec["new_server"])
-        rec["new_database"]= dB.text_input("New database", value=rec["new_database"])
-        rec["new_schema"]  = dC.text_input("New schema", value=rec["new_schema"])
-        rec["new_table"]   = dD.text_input("New table", value=rec["new_table"])
+        rec["new_server"]   = dA.text_input("New server", value=rec["new_server"])
+        rec["new_database"] = dB.text_input("New database", value=rec["new_database"])
+        rec["new_schema"]   = dC.selectbox(
+            "New schema",
+            SCHEMA_CHOICES,
+            index=SCHEMA_CHOICES.index(rec.get("new_schema", DEFAULT_SCHEMA))
+                if rec.get("new_schema", DEFAULT_SCHEMA) in SCHEMA_CHOICES else 0,
+            key=f"new_schema_{rid}",
+        )
+        rec["new_table"]    = dD.text_input("New table", value=rec["new_table"])
+
 
         rec["dataset_report"] = st.text_input("Dataset/Report", value=rec["dataset_report"])
         rec["migration_method"] = st.radio("Migration method", MIGRATION_METHODS,
