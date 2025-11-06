@@ -41,7 +41,7 @@ import streamlit as st
 
 # -------- Simple password gate (single shared password) --------
 def _get_app_password() -> str:
-    pw = os.getenv("lesmillsreport")
+    pw ="lesmillsreport"
     return pw
 
 def password_gate():
