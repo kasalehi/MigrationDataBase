@@ -34,7 +34,78 @@ import uuid
 import tempfile
 import shutil
 
-APP_NAME = "PBI_MigrationPlanner"
+## lets make it secure 
+
+import os
+import streamlit as st
+
+# -------- Simple password gate (single shared password) --------
+def _get_app_password() -> str:
+    # Prefer Streamlit secrets; fallback to env var
+    # Do NOT hardcode in code.
+    pw = st.secrets.get("APP_PASSWORD", "")
+    if not pw:
+        pw = os.getenv("APP_PASSWORD", "")
+    return pw
+
+def password_gate():
+    # Already unlocked?
+    if st.session_state.get("authed", False):
+        return True
+
+    # Basic rate-limit: 5 tries, then 60s cool-down
+    st.session_state.setdefault("tries", 0)
+    st.session_state.setdefault("lock_until", 0)
+
+    import time
+    now = int(time.time())
+    if now < st.session_state["lock_until"]:
+        wait = st.session_state["lock_until"] - now
+        st.error(f"Too many attempts. Try again in {wait}s.")
+        st.stop()
+
+    st.title("🔐 Sign in")
+    pwd = st.text_input("Password", type="password", key="__app_pwd")
+    submitted = st.button("Unlock", type="primary")
+
+    if submitted:
+        if not _get_app_password():
+            st.error("APP_PASSWORD is not configured in secrets or environment.")
+            st.stop()
+
+        if pwd == _get_app_password():
+            st.session_state["authed"] = True
+            st.session_state["tries"] = 0
+            st.rerun()
+        else:
+            st.session_state["tries"] += 1
+            if st.session_state["tries"] >= 5:
+                st.session_state["lock_until"] = now + 60  # 60s cool-down
+                st.error("Incorrect password. Locked for 60 seconds.")
+            else:
+                left = 5 - st.session_state["tries"]
+                st.error(f"Incorrect password. {left} attempt(s) left.")
+    st.stop()
+
+password_gate()  # <-- Gate everything below this line
+
+# Optional: add a logout button in the sidebar (after gate)
+with st.sidebar:
+    if st.session_state.get("authed"):
+        if st.button("Logout"):
+            for k in ("authed", "tries", "lock_until", "__app_pwd"):
+                st.session_state.pop(k, None)
+            st.rerun()
+# ---------------------------------------------------------------
+
+
+
+
+
+
+
+
+APP_NAME = "Database Tables MigrationPlanner"
 BASE_DIR = Path.home() / "Documents" / APP_NAME
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = BASE_DIR / "planner.sqlite3"
