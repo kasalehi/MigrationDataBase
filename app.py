@@ -519,7 +519,7 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
             df2 = fetch_df(engine)
             atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
             st.success("Updated and mirrored to CSV.")
-            st.experimental_rerun()
+            st.rerun()
 
         if del_clicked:
             with st.modal("Confirm delete"):
@@ -532,7 +532,7 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
                     df2 = fetch_df(engine)
                     atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
                     st.success("Row deleted and CSV updated.")
-                    st.experimental_rerun()
+                    st.rerun()
 
 st.divider()
 
@@ -559,7 +559,7 @@ with st.expander("🗑️ Delete rows", expanded=False):
                 df2 = fetch_df(engine)
                 atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
                 st.success(f"Deleted {n} row(s) and updated CSV.")
-                st.experimental_rerun()
+                st.rerun()
 
 with st.expander("ℹ️ Notes"):
     st.markdown(
