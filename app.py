@@ -9,6 +9,7 @@
 # - CSV mirror with atomic writes
 # - Duplicate mappings blocked (unique index + pre-check)
 # - Single shared password gate
+# - Delete rows (single or multi) with confirmation
 
 from __future__ import annotations
 from pathlib import Path
@@ -191,7 +192,7 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     row.setdefault("created_at", now)
     row["updated_at"] = now
 
-    # Normalize to avoid case/whitespace duplicates (dbo vs DBO)
+    # Normalize to avoid case/whitespace duplicates
     row["old_schema"] = (row.get("old_schema") or "").strip().lower()
     row["new_schema"] = (row.get("new_schema") or "").strip().lower()
     row["old_server"] = (row.get("old_server") or "").strip()
@@ -252,6 +253,17 @@ def update_entry(engine: Engine, row: dict) -> None:
     """)
     with engine.begin() as conn:
         conn.execute(sql, row)
+
+def delete_entries(engine: Engine, ids: list[str]) -> int:
+    """Delete rows by id. Returns number deleted."""
+    if not ids:
+        return 0
+    # Use executemany-style parameters
+    sql = text("DELETE FROM entries WHERE id = :id")
+    with engine.begin() as conn:
+        for _id in ids:
+            conn.execute(sql, {"id": _id})
+    return len(ids)
 
 def fetch_df(engine: Engine) -> pd.DataFrame:
     with engine.begin() as conn:
@@ -471,7 +483,11 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
         )
         new_notes = st.text_area("Notes / SQL", value=rec.get("comment_sql") or "", height=160)
 
-        if st.button("Save changes"):
+        c1, c2 = st.columns([1,1])
+        save_clicked = c1.button("💾 Save changes")
+        del_clicked  = c2.button("🗑️ Delete this row")
+
+        if save_clicked:
             rec["comment_sql"] = new_notes
 
             # Normalize to avoid case/space duplicates
@@ -503,6 +519,47 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
             df2 = fetch_df(engine)
             atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
             st.success("Updated and mirrored to CSV.")
+            st.experimental_rerun()
+
+        if del_clicked:
+            with st.modal("Confirm delete"):
+                st.write("This will delete the selected row from the plan and CSV.")
+                confirm = st.checkbox("Yes, delete this row permanently")
+                go = st.button("Delete now", type="primary")
+                cancel = st.button("Cancel")
+                if go and confirm:
+                    delete_entries(engine, [rid])
+                    df2 = fetch_df(engine)
+                    atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                    st.success("Row deleted and CSV updated.")
+                    st.experimental_rerun()
+
+st.divider()
+
+# -------- NEW: Multi-delete tool --------
+with st.expander("🗑️ Delete rows", expanded=False):
+    if df.empty:
+        st.info("No rows to delete.")
+    else:
+        df["label_del"] = df.apply(
+            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  (id={r['id'][:8]}…)",
+            axis=1
+        )
+        to_delete_labels = st.multiselect("Select one or more rows to delete", df["label_del"].tolist())
+        ids_to_delete = df.loc[df["label_del"].isin(to_delete_labels), "id"].tolist()
+        colA, colB = st.columns([1,2])
+        sure = colA.checkbox("I understand this is permanent")
+        do_delete = colB.button("Delete selected", type="primary", disabled=not ids_to_delete)
+
+        if do_delete:
+            if not sure:
+                st.warning("Please tick the confirmation checkbox first.")
+            else:
+                n = delete_entries(engine, ids_to_delete)
+                df2 = fetch_df(engine)
+                atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                st.success(f"Deleted {n} row(s) and updated CSV.")
+                st.experimental_rerun()
 
 with st.expander("ℹ️ Notes"):
     st.markdown(
