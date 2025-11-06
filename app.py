@@ -425,15 +425,29 @@ st.divider()
 
 df = fetch_df(engine)
 
-with st.expander("🔎 Filter, view, export", expanded=True):
+# --- allowed statuses ---
+STATUS_CHOICES = ["In Progress", "Completed"]
+DEFAULT_STATUS = "In Progress"
+
+def normalize_status_values(df: pd.DataFrame) -> pd.DataFrame:
+    if "status" not in df.columns:
+        df["status"] = DEFAULT_STATUS
+        return df
+    df["status"] = df["status"].fillna("").astype(str).str.strip()
+    df.loc[~df["status"].isin(STATUS_CHOICES), "status"] = DEFAULT_STATUS
+    return df
+
+with st.expander("🔎 Filter, edit status inline, export", expanded=True):
+    # fresh pull + normalize legacy statuses to just the two allowed
+    raw = fetch_df(engine).copy()
+    view = normalize_status_values(raw)
+
+    # -------- filters ----------
     f1, f2, f3 = st.columns(3)
     f_ds  = f1.text_input("Dataset/Report contains")
     f_tbl = f2.text_input("Table contains (old/new)")
     f_st  = f3.multiselect("Status", STATUS_CHOICES, default=[])
 
-    view = fetch_df(engine).copy()
-
-    # --- filters ---
     if f_ds:
         view = view[view["dataset_report"].str.contains(f_ds, case=False, na=False)]
     if f_tbl:
@@ -445,7 +459,7 @@ with st.expander("🔎 Filter, view, export", expanded=True):
     if f_st:
         view = view[view["status"].isin(f_st)]
 
-    # --- put Status up-front in the table, and ensure it's always included ---
+    # -------- show status first; make it editable with two options ----------
     preferred_order = [
         "status",
         "dataset_report",
@@ -457,26 +471,72 @@ with st.expander("🔎 Filter, view, export", expanded=True):
     ]
     cols_in_view = [c for c in preferred_order if c in view.columns] + \
                    [c for c in view.columns if c not in preferred_order]
-    view = view[cols_in_view]
+    view = view[cols_in_view].reset_index(drop=True)
 
-    # --- quick status summary ---
-    st.caption("Status summary")
-    if not view.empty and "status" in view.columns:
-        counts = view["status"].value_counts().reindex(STATUS_CHOICES, fill_value=0)
+    st.caption("Edit statuses directly in the grid, then click **Save edits** to persist.")
+    edited = st.data_editor(
+        view,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "status": st.column_config.SelectboxColumn(
+                "Status",
+                options=STATUS_CHOICES,
+                help="Only two options are allowed.",
+                width="small",
+                required=True,
+                default=DEFAULT_STATUS,
+            )
+        },
+        disabled=[  # lock down non-editable columns
+            "dataset_report","old_server","old_database","old_schema","old_table",
+            "new_server","new_database","new_schema","new_table",
+            "migration_method","comment_sql","created_at","updated_at","id"
+        ],
+        hide_index=True,
+        key="edit_view",
+    )
+
+    # -------- persist inline status edits ----------
+    # We only compare (id, status) pairs and write changes
+    if st.button("💾 Save edits"):
+        try:
+            # ensure only the two statuses will ever be saved
+            edited = normalize_status_values(edited)
+            changes = edited[["id","status"]].merge(
+                raw[["id","status"]], on="id", how="left", suffixes=("_new","_old")
+            )
+            to_update = changes[changes["status_new"] != changes["status_old"]][["id","status_new"]]
+
+            if not to_update.empty:
+                with engine.begin() as conn:
+                    for _id, _st in to_update.itertuples(index=False, name=None):
+                        conn.execute(
+                            text("UPDATE entries SET status = :s, updated_at = :u WHERE id = :i"),
+                            {"s": _st, "u": datetime.utcnow().isoformat(timespec="seconds"), "i": _id},
+                        )
+                # refresh + mirror to CSV
+                df2 = fetch_df(engine)
+                atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                st.success(f"Saved {len(to_update)} status change(s) and updated CSV.")
+                st.rerun()
+            else:
+                st.info("No changes to save.")
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+    # -------- quick status summary ----------
+    if not edited.empty:
+        counts = edited["status"].value_counts().reindex(STATUS_CHOICES, fill_value=0)
         cA, cB = st.columns(2)
         cA.metric("In Progress", int(counts.get("In Progress", 0)))
         cB.metric("Completed",   int(counts.get("Completed", 0)))
-    else:
-        st.write("—")
 
-    # --- table ---
-    st.dataframe(view, use_container_width=True)
-
-    # --- export (Status is included because we export 'view' as-is) ---
+    # -------- export (always includes Status as first column) ----------
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     st.download_button(
         "⬇️ Download filtered CSV (includes Status)",
-        data=view.to_csv(index=False),
+        data=edited.to_csv(index=False),
         file_name=f"PBI_TableMigration_{ts}.csv",
         mime="text/csv"
     )
