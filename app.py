@@ -41,11 +41,7 @@ import streamlit as st
 
 # -------- Simple password gate (single shared password) --------
 def _get_app_password() -> str:
-    # Prefer Streamlit secrets; fallback to env var
-    # Do NOT hardcode in code.
-    pw = st.secrets.get("APP_PASSWORD", "")
-    if not pw:
-        pw = os.getenv("APP_PASSWORD", "")
+    pw = os.getenv("APP_PASSWORD")
     return pw
 
 def password_gate():
