@@ -285,8 +285,8 @@ def build_script(row: dict) -> str:
 
 # ---------------- UI ----------------
 
-st.set_page_config(page_title="Power BI – Table Migration Planner", page_icon="📤", layout="wide")
-st.title("📤 Power BI – Table Migration Planner")
+st.set_page_config(page_title="Table Migration Planner", page_icon="📤", layout="wide")
+st.title("📤 Table Migration Planner")
 st.caption(f"Data folder: {BASE_DIR}")
 engine = get_engine(); ensure_db(engine)
 
