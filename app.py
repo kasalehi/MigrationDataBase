@@ -360,8 +360,8 @@ def build_script(row: dict) -> str:
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="LessMills Migration Planner", page_icon="📤", layout="wide")
-st.title("📤 LessMills Migration Planner")
+st.set_page_config(page_title="Les Mills Migration Planner", page_icon="📤", layout="wide")
+st.title("📤 Les Mills Migration Planner")
 st.caption(f"Data folder: {BASE_DIR}")
 
 engine = get_engine(); ensure_db(engine)
