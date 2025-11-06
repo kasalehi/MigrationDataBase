@@ -4,6 +4,7 @@
 # to a NEW SQL Server database.
 #
 # - Captures dataset/report + exact OLD→NEW table mapping
+# - Tracks Status: "In Progress" / "Completed"
 # - One-click T-SQL script generation for copy methods
 # - Durable storage in SQLite (~/Documents/Database Tables MigrationPlanner)
 # - CSV mirror with atomic writes
@@ -34,6 +35,9 @@ OLD_DB_DEFAULT     = "LesMills_Reporting"
 
 NEW_SERVER_DEFAULT = r"LMNZLREPORT01\LM_RPT"
 NEW_DB_DEFAULT     = "LesMills_Report"
+
+STATUS_CHOICES = ["In Progress", "Completed"]
+DEFAULT_STATUS = "In Progress"
 
 # -------- Simple password gate (single shared password) --------
 def _get_app_password() -> str:
@@ -106,9 +110,23 @@ CREATE TABLE IF NOT EXISTS entries (
   old_server TEXT, old_database TEXT, old_schema TEXT, old_table TEXT,
   new_server TEXT, new_database TEXT, new_schema TEXT, new_table TEXT,
   migration_method TEXT,
-  comment_sql TEXT
+  comment_sql TEXT,
+  status TEXT
 );
 """
+
+def migrate_add_status(engine: Engine) -> None:
+    # Add status column if missing; backfill NULLs to DEFAULT_STATUS
+    with engine.begin() as conn:
+        cols = conn.exec_driver_sql("PRAGMA table_info(entries);").fetchall()
+        names = [c[1] for c in cols]  # (cid, name, type, notnull, dflt_value, pk)
+        if "status" not in names:
+            conn.exec_driver_sql(f"ALTER TABLE entries ADD COLUMN status TEXT;")
+        # Backfill any NULLs
+        conn.exec_driver_sql(
+            "UPDATE entries SET status = :dflt WHERE status IS NULL OR TRIM(status) = ''",
+            {"dflt": DEFAULT_STATUS},
+        )
 
 def dedupe_entries(engine: Engine) -> int:
     """
@@ -153,12 +171,15 @@ def ensure_db(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.exec_driver_sql(SCHEMA_SQL)
 
-    # 1) Dedupe existing rows before adding unique constraint
+    # Migrate to ensure `status` exists and is populated
+    migrate_add_status(engine)
+
+    # Dedupe existing rows before adding unique constraint
     removed = dedupe_entries(engine)
     if removed:
         st.warning(f"Removed {removed} duplicate mapping(s) found in existing data.")
 
-    # 2) Add UNIQUE index (prevents future duplicates even under race)
+    # Add UNIQUE index (prevents future duplicates even under race)
     try:
         with engine.begin() as conn:
             conn.exec_driver_sql("""
@@ -201,6 +222,7 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     row["new_database"] = (row.get("new_database") or "").strip()
     row["old_table"] = (row.get("old_table") or "").strip()
     row["new_table"] = (row.get("new_table") or "").strip()
+    row["status"] = (row.get("status") or DEFAULT_STATUS).strip()
 
     if mapping_exists(engine, row):
         return False, "This OLD→NEW table mapping already exists — not added."
@@ -210,12 +232,12 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
           id, created_at, updated_at, dataset_report,
           old_server, old_database, old_schema, old_table,
           new_server, new_database, new_schema, new_table,
-          migration_method, comment_sql
+          migration_method, comment_sql, status
         ) VALUES (
           :id, :created_at, :updated_at, :dataset_report,
           :old_server, :old_database, :old_schema, :old_table,
           :new_server, :new_database, :new_schema, :new_table,
-          :migration_method, :comment_sql
+          :migration_method, :comment_sql, :status
         )
     """)
     try:
@@ -240,6 +262,7 @@ def update_entry(engine: Engine, row: dict) -> None:
     row["new_database"] = (row.get("new_database") or "").strip()
     row["old_table"] = (row.get("old_table") or "").strip()
     row["new_table"] = (row.get("new_table") or "").strip()
+    row["status"] = (row.get("status") or DEFAULT_STATUS).strip()
 
     sql = text("""
         UPDATE entries SET
@@ -248,7 +271,8 @@ def update_entry(engine: Engine, row: dict) -> None:
           old_server=:old_server, old_database=:old_database, old_schema=:old_schema, old_table=:old_table,
           new_server=:new_server, new_database=:new_database, new_schema=:new_schema, new_table=:new_table,
           migration_method=:migration_method,
-          comment_sql=:comment_sql
+          comment_sql=:comment_sql,
+          status=:status
         WHERE id=:id
     """)
     with engine.begin() as conn:
@@ -258,7 +282,6 @@ def delete_entries(engine: Engine, ids: list[str]) -> int:
     """Delete rows by id. Returns number deleted."""
     if not ids:
         return 0
-    # Use executemany-style parameters
     sql = text("DELETE FROM entries WHERE id = :id")
     with engine.begin() as conn:
         for _id in ids:
@@ -368,6 +391,7 @@ with st.expander("➕ Add table move", expanded=True):
 
         migration_method = st.radio("Migration method", MIGRATION_METHODS, horizontal=True)
         comment_sql = st.text_area("Notes / extra SQL (optional)", height=140)
+        status_val = st.selectbox("Status", STATUS_CHOICES, index=STATUS_CHOICES.index(DEFAULT_STATUS))
 
         submitted = st.form_submit_button("Add to plan")
         if submitted:
@@ -384,6 +408,7 @@ with st.expander("➕ Add table move", expanded=True):
                 new_table=new_table.strip(),
                 migration_method=migration_method,
                 comment_sql=comment_sql.strip(),
+                status=status_val.strip(),
             )
             if not rec["dataset_report"] or not rec["old_table"] or not rec["new_table"]:
                 st.error("Dataset/Report, Old table, and New table are required.")
@@ -401,9 +426,10 @@ st.divider()
 df = fetch_df(engine)
 
 with st.expander("🔎 Filter, view, export", expanded=True):
-    f1,f2 = st.columns(2)
+    f1,f2,f3 = st.columns(3)
     f_ds  = f1.text_input("Dataset/Report contains")
     f_tbl = f2.text_input("Table contains (old/new)")
+    f_st  = f3.multiselect("Status", STATUS_CHOICES, default=[])
 
     view = df.copy()
     if f_ds: view = view[view["dataset_report"].str.contains(f_ds, case=False, na=False)]
@@ -413,6 +439,8 @@ with st.expander("🔎 Filter, view, export", expanded=True):
             view["new_table"].str.contains(f_tbl, case=False, na=False)
         )
         view = view[mask]
+    if f_st:
+        view = view[view["status"].isin(f_st)]
 
     st.dataframe(view, use_container_width=True)
     if st.button("⬇️ Export filtered view to CSV"):
@@ -431,7 +459,7 @@ with st.expander("🧰 Generate T-SQL for a selected row", expanded=False):
         st.info("No rows yet.")
     else:
         df["label"] = df.apply(
-            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}",
+            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  [{r.get('status','')}]",
             axis=1
         )
         choice = st.selectbox("Pick an item", df["label"].tolist())
@@ -446,7 +474,8 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
     if df.empty:
         st.info("No rows yet.")
     else:
-        df["label2"] = df.apply(lambda r: f"{r['dataset_report']} → {r['new_schema']}.{r['new_table']}", axis=1)
+        df["label2"] = df.apply(lambda r: f"{r['dataset_report']} → {r['new_schema']}.{r['new_table']}  [{r.get('status','')}]",
+                                axis=1)
         pick = st.selectbox("Choose row", df["label2"].tolist())
         rid = df.loc[df["label2"]==pick, "id"].iloc[0]
         rec = df.loc[df["id"]==rid].iloc[0].to_dict()
@@ -481,6 +510,8 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
             index=MIGRATION_METHODS.index(rec.get("migration_method") or MIGRATION_METHODS[0]),
             horizontal=True
         )
+        rec["status"] = st.selectbox("Status", STATUS_CHOICES,
+                                     index=STATUS_CHOICES.index(rec.get("status", DEFAULT_STATUS)))
         new_notes = st.text_area("Notes / SQL", value=rec.get("comment_sql") or "", height=160)
 
         c1, c2 = st.columns([1,1])
@@ -499,6 +530,7 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
             rec["new_database"] = (rec["new_database"] or "").strip()
             rec["old_table"] = (rec["old_table"] or "").strip()
             rec["new_table"] = (rec["new_table"] or "").strip()
+            rec["status"] = (rec.get("status") or DEFAULT_STATUS).strip()
 
             # Prevent updates that would create a duplicate mapping (different id)
             existing = df[
@@ -522,27 +554,25 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
             st.rerun()
 
         if del_clicked:
-            with st.modal("Confirm delete"):
-                st.write("This will delete the selected row from the plan and CSV.")
-                confirm = st.checkbox("Yes, delete this row permanently")
-                go = st.button("Delete now", type="primary")
-                cancel = st.button("Cancel")
-                if go and confirm:
-                    delete_entries(engine, [rid])
-                    df2 = fetch_df(engine)
-                    atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
-                    st.success("Row deleted and CSV updated.")
-                    st.rerun()
+            # Inline confirm (works across Streamlit versions)
+            confirm = st.checkbox("Yes, delete this row permanently", key=f"confirm_del_{rid}")
+            if confirm and st.button("Delete now", type="primary", key=f"del_now_{rid}"):
+                delete_entries(engine, [rid])
+                df2 = fetch_df(engine)
+                atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                st.success("Row deleted and CSV updated.")
+                st.rerun()
 
 st.divider()
 
-# -------- NEW: Multi-delete tool --------
+# -------- Multi-delete tool --------
 with st.expander("🗑️ Delete rows", expanded=False):
+    df = fetch_df(engine)  # refresh in case of prior edits
     if df.empty:
         st.info("No rows to delete.")
     else:
         df["label_del"] = df.apply(
-            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  (id={r['id'][:8]}…)",
+            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  [{r.get('status','')}]  (id={r['id'][:8]}…)",
             axis=1
         )
         to_delete_labels = st.multiselect("Select one or more rows to delete", df["label_del"].tolist())
@@ -564,6 +594,9 @@ with st.expander("🗑️ Delete rows", expanded=False):
 with st.expander("ℹ️ Notes"):
     st.markdown(
         f"""
+        **Status tracking**
+        - Each mapping has a Status ("In Progress" or "Completed"). You can filter by status and export filtered CSVs.
+
         **T-SQL generation**
         - *Create+Insert (safe)* builds empty target via `TOP(0)` and inserts rows; recreate PKs/indexes after.
         - *SELECT INTO (quick copy)* fastest first load; recreate PKs/indexes after.
