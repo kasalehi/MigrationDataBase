@@ -1,22 +1,28 @@
 # streamlit_pbi_table_migration_planner.py
 # -------------------------------------------------
 # Plan and track moving tables from an OLD SQL Server database
-# to a NEW SQL Server database, prioritized by Power BI reports.
+# to a NEW SQL Server database.
 #
-# (No Priority/Status; duplicate mappings are blocked.)
+# - Captures dataset/report + exact OLD→NEW table mapping
+# - One-click T-SQL script generation for copy methods
+# - Durable storage in SQLite (~/Documents/Database Tables MigrationPlanner)
+# - CSV mirror with atomic writes
+# - Duplicate mappings blocked (unique index + pre-check)
+# - Single shared password gate
 
 from __future__ import annotations
-import os
 from pathlib import Path
 from datetime import datetime
-import tempfile, shutil, uuid
+import tempfile
+import shutil
+import uuid
+import os
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from filelock import FileLock
-
 
 # --- Defaults for your environment ---
 SCHEMA_CHOICES     = ["dim", "dbo", "repo", "pbi", "mart"]
@@ -28,10 +34,9 @@ OLD_DB_DEFAULT     = "LesMills_Reporting"
 NEW_SERVER_DEFAULT = r"LMNZLREPORT01\LM_RPT"
 NEW_DB_DEFAULT     = "LesMills_Report"
 
-
 # -------- Simple password gate (single shared password) --------
 def _get_app_password() -> str:
-    # Keep this in secrets/env in production; hardcoded here per your ask
+    # For production, move to st.secrets["APP_PASSWORD"] or env var.
     return "lesmillsreport"
 
 def password_gate():
@@ -91,7 +96,6 @@ def get_engine() -> Engine:
     return create_engine(f"sqlite:///{DB_PATH.as_posix()}", future=True)
 
 # --- schema & integrity helpers ---
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entries (
   id TEXT PRIMARY KEY,
@@ -110,8 +114,6 @@ def dedupe_entries(engine: Engine) -> int:
     Remove duplicate mappings, keeping the earliest created row per mapping.
     Returns number of rows deleted.
     """
-    # Delete everything that is not the MIN(created_at,id) within each mapping group
-    # (works on all modern SQLite versions)
     sql = text("""
         DELETE FROM entries
         WHERE id NOT IN (
@@ -141,10 +143,10 @@ def dedupe_entries(engine: Engine) -> int:
         );
     """)
     with engine.begin() as conn:
-        res = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+        before = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
         conn.execute(sql)
-        res2 = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
-    return (res - res2)
+        after = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+    return (before - after)
 
 def ensure_db(engine: Engine) -> None:
     with engine.begin() as conn:
@@ -155,7 +157,7 @@ def ensure_db(engine: Engine) -> None:
     if removed:
         st.warning(f"Removed {removed} duplicate mapping(s) found in existing data.")
 
-    # 2) Now add the UNIQUE index (safe on clean data)
+    # 2) Add UNIQUE index (prevents future duplicates even under race)
     try:
         with engine.begin() as conn:
             conn.exec_driver_sql("""
@@ -166,7 +168,6 @@ def ensure_db(engine: Engine) -> None:
                 );
             """)
     except Exception as e:
-        # As a fallback, surface a helpful message
         st.error(f"Failed to create unique index. Reason: {e}")
 
 def mapping_exists(engine: Engine, rec: dict) -> bool:
@@ -190,6 +191,16 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     row.setdefault("created_at", now)
     row["updated_at"] = now
 
+    # Normalize to avoid case/whitespace duplicates (dbo vs DBO)
+    row["old_schema"] = (row.get("old_schema") or "").strip().lower()
+    row["new_schema"] = (row.get("new_schema") or "").strip().lower()
+    row["old_server"] = (row.get("old_server") or "").strip()
+    row["new_server"] = (row.get("new_server") or "").strip()
+    row["old_database"] = (row.get("old_database") or "").strip()
+    row["new_database"] = (row.get("new_database") or "").strip()
+    row["old_table"] = (row.get("old_table") or "").strip()
+    row["new_table"] = (row.get("new_table") or "").strip()
+
     if mapping_exists(engine, row):
         return False, "This OLD→NEW table mapping already exists — not added."
 
@@ -211,7 +222,6 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
             conn.execute(sql, row)
         return True, "Saved to plan."
     except Exception as e:
-        # In case of race, unique index will throw; surface a friendly message
         msg = str(e)
         if "ux_entries_mapping" in msg or "UNIQUE" in msg.upper():
             return False, "This OLD→NEW table mapping already exists — not added."
@@ -220,6 +230,16 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
 def update_entry(engine: Engine, row: dict) -> None:
     row = row.copy()
     row["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    # Normalize on update too
+    row["old_schema"] = (row.get("old_schema") or "").strip().lower()
+    row["new_schema"] = (row.get("new_schema") or "").strip().lower()
+    row["old_server"] = (row.get("old_server") or "").strip()
+    row["new_server"] = (row.get("new_server") or "").strip()
+    row["old_database"] = (row.get("old_database") or "").strip()
+    row["new_database"] = (row.get("new_database") or "").strip()
+    row["old_table"] = (row.get("old_table") or "").strip()
+    row["new_table"] = (row.get("new_table") or "").strip()
+
     sql = text("""
         UPDATE entries SET
           updated_at=:updated_at,
@@ -313,13 +333,13 @@ engine = get_engine(); ensure_db(engine)
 with st.expander("➕ Add table move", expanded=True):
     with st.form("new_row"):
         dataset_report = st.text_input("Dataset/Report name *", placeholder="e.g., Customer (Service)")
+
         st.markdown("**Old (source)**")
         o1,o2,o3,o4 = st.columns(4)
         old_server = o1.text_input("Old server", value=OLD_SERVER_DEFAULT)
         old_db     = o2.text_input("Old database", value=OLD_DB_DEFAULT)
         old_schema = o3.selectbox(
-            "Old schema",
-            SCHEMA_CHOICES,
+            "Old schema", SCHEMA_CHOICES,
             index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in SCHEMA_CHOICES else 0,
         )
         old_table  = o4.text_input("Old table *", placeholder="Customer")
@@ -329,17 +349,9 @@ with st.expander("➕ Add table move", expanded=True):
         new_server = n1.text_input("New server", value=NEW_SERVER_DEFAULT)
         new_db     = n2.text_input("New database", value=NEW_DB_DEFAULT)
         new_schema = n3.selectbox(
-            "New schema",
-            SCHEMA_CHOICES,
+            "New schema", SCHEMA_CHOICES,
             index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in SCHEMA_CHOICES else 0,
         )
-        new_table  = n4.text_input("New table *", placeholder="Customer")
-
-        st.markdown("**New (target)**")
-        n1,n2,n3,n4 = st.columns(4)
-        new_server = n1.text_input("New server", placeholder="LMNZLRPT001\\LM_RPT_NEW")
-        new_db     = n2.text_input("New database", placeholder="LMNZ_Report_New")
-        new_schema = n3.text_input("New schema", value="dbo")
         new_table  = n4.text_input("New table *", placeholder="Customer")
 
         migration_method = st.radio("Migration method", MIGRATION_METHODS, horizontal=True)
@@ -347,10 +359,17 @@ with st.expander("➕ Add table move", expanded=True):
 
         submitted = st.form_submit_button("Add to plan")
         if submitted:
+            # Normalize before duplicate check
             rec = dict(
                 dataset_report=dataset_report.strip(),
-                old_server=old_server.strip(), old_database=old_db.strip(), old_schema=old_schema.strip(), old_table=old_table.strip(),
-                new_server=new_server.strip(), new_database=new_db.strip(), new_schema=new_schema.strip(), new_table=new_table.strip(),
+                old_server=old_server.strip(),
+                old_database=old_db.strip(),
+                old_schema=old_schema.strip().lower(),
+                old_table=old_table.strip(),
+                new_server=new_server.strip(),
+                new_database=new_db.strip(),
+                new_schema=new_schema.strip().lower(),
+                new_table=new_table.strip(),
                 migration_method=migration_method,
                 comment_sql=comment_sql.strip(),
             )
@@ -444,30 +463,41 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
         )
         rec["new_table"]    = dD.text_input("New table", value=rec["new_table"])
 
-
         rec["dataset_report"] = st.text_input("Dataset/Report", value=rec["dataset_report"])
-        rec["migration_method"] = st.radio("Migration method", MIGRATION_METHODS,
-                                           index=MIGRATION_METHODS.index(rec.get("migration_method") or MIGRATION_METHODS[0]),
-                                           horizontal=True)
+        rec["migration_method"] = st.radio(
+            "Migration method", MIGRATION_METHODS,
+            index=MIGRATION_METHODS.index(rec.get("migration_method") or MIGRATION_METHODS[0]),
+            horizontal=True
+        )
         new_notes = st.text_area("Notes / SQL", value=rec.get("comment_sql") or "", height=160)
 
         if st.button("Save changes"):
             rec["comment_sql"] = new_notes
 
-            # Prevent updates that would create a duplicate mapping
-            if mapping_exists(engine, rec) and df.loc[df["id"]==rid].empty is False:
-                # If mapping exists on a different id, block
-                existing = df[(df["old_server"]==rec["old_server"]) &
-                              (df["old_database"]==rec["old_database"]) &
-                              (df["old_schema"]==rec["old_schema"]) &
-                              (df["old_table"]==rec["old_table"]) &
-                              (df["new_server"]==rec["new_server"]) &
-                              (df["new_database"]==rec["new_database"]) &
-                              (df["new_schema"]==rec["new_schema"]) &
-                              (df["new_table"]==rec["new_table"])]
-                if not existing.empty and existing.iloc[0]["id"] != rid:
-                    st.warning("This OLD→NEW table mapping already exists — not updated.")
-                    st.stop()
+            # Normalize to avoid case/space duplicates
+            rec["old_schema"] = (rec["old_schema"] or "").strip().lower()
+            rec["new_schema"] = (rec["new_schema"] or "").strip().lower()
+            rec["old_server"] = (rec["old_server"] or "").strip()
+            rec["new_server"] = (rec["new_server"] or "").strip()
+            rec["old_database"] = (rec["old_database"] or "").strip()
+            rec["new_database"] = (rec["new_database"] or "").strip()
+            rec["old_table"] = (rec["old_table"] or "").strip()
+            rec["new_table"] = (rec["new_table"] or "").strip()
+
+            # Prevent updates that would create a duplicate mapping (different id)
+            existing = df[
+                (df["old_server"]==rec["old_server"]) &
+                (df["old_database"]==rec["old_database"]) &
+                (df["old_schema"]==rec["old_schema"]) &
+                (df["old_table"]==rec["old_table"]) &
+                (df["new_server"]==rec["new_server"]) &
+                (df["new_database"]==rec["new_database"]) &
+                (df["new_schema"]==rec["new_schema"]) &
+                (df["new_table"]==rec["new_table"])
+            ]
+            if not existing.empty and existing.iloc[0]["id"] != rid:
+                st.warning("This OLD→NEW table mapping already exists — not updated.")
+                st.stop()
 
             update_entry(engine, rec)
             df2 = fetch_df(engine)
