@@ -426,13 +426,16 @@ st.divider()
 df = fetch_df(engine)
 
 with st.expander("🔎 Filter, view, export", expanded=True):
-    f1,f2,f3 = st.columns(3)
+    f1, f2, f3 = st.columns(3)
     f_ds  = f1.text_input("Dataset/Report contains")
     f_tbl = f2.text_input("Table contains (old/new)")
     f_st  = f3.multiselect("Status", STATUS_CHOICES, default=[])
 
-    view = df.copy()
-    if f_ds: view = view[view["dataset_report"].str.contains(f_ds, case=False, na=False)]
+    view = fetch_df(engine).copy()
+
+    # --- filters ---
+    if f_ds:
+        view = view[view["dataset_report"].str.contains(f_ds, case=False, na=False)]
     if f_tbl:
         mask = (
             view["old_table"].str.contains(f_tbl, case=False, na=False) |
@@ -442,15 +445,42 @@ with st.expander("🔎 Filter, view, export", expanded=True):
     if f_st:
         view = view[view["status"].isin(f_st)]
 
+    # --- put Status up-front in the table, and ensure it's always included ---
+    preferred_order = [
+        "status",
+        "dataset_report",
+        "old_server","old_database","old_schema","old_table",
+        "new_server","new_database","new_schema","new_table",
+        "migration_method",
+        "comment_sql",
+        "created_at","updated_at","id",
+    ]
+    cols_in_view = [c for c in preferred_order if c in view.columns] + \
+                   [c for c in view.columns if c not in preferred_order]
+    view = view[cols_in_view]
+
+    # --- quick status summary ---
+    st.caption("Status summary")
+    if not view.empty and "status" in view.columns:
+        counts = view["status"].value_counts().reindex(STATUS_CHOICES, fill_value=0)
+        cA, cB = st.columns(2)
+        cA.metric("In Progress", int(counts.get("In Progress", 0)))
+        cB.metric("Completed",   int(counts.get("Completed", 0)))
+    else:
+        st.write("—")
+
+    # --- table ---
     st.dataframe(view, use_container_width=True)
-    if st.button("⬇️ Export filtered view to CSV"):
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        st.download_button(
-            "Download now",
-            data=view.to_csv(index=False),
-            file_name=f"PBI_TableMigration_{ts}.csv",
-            mime="text/csv"
-        )
+
+    # --- export (Status is included because we export 'view' as-is) ---
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "⬇️ Download filtered CSV (includes Status)",
+        data=view.to_csv(index=False),
+        file_name=f"PBI_TableMigration_{ts}.csv",
+        mime="text/csv"
+    )
+
 
 st.divider()
 
