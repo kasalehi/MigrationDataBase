@@ -159,6 +159,7 @@ def dedupe_entries(engine: Engine) -> int:
     return (before - after)
 
 
+
 def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     """Returns (ok, message). Blocks duplicates."""
     row = row.copy()
