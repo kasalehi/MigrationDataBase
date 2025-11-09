@@ -5,4 +5,8 @@ sqlalchemy
 pydantic 
 filelock
 Office365-REST-Python-Client
+<<<<<<< HEAD
 psycopg[binary]
+=======
+psycopg
+>>>>>>> 5fc3abd002e9263b2ffac9bd23d27944b98403b0
