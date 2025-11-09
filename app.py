@@ -41,7 +41,14 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH   = BASE_DIR / "planner.sqlite3"         # local dev fallback
 CSV_PATH  = BASE_DIR / "entries.csv"             # local mirror
 LOCK_PATH = str(BASE_DIR / "entries.csv.lock")
+DATABASE_URL = "postgresql+psycopg://postgres:Friday%403840011655@db.wwhvgbgrsoztycglktix.supabase.co:5432/postgres?sslmode=require"
 
+# OR Option B: parts (safer if your password has special characters)
+DB_HOST = "db.wwhvgbgrsoztycglktix.supabase.co"
+DB_PORT = "5432"
+DB_NAME = "postgres"
+DB_USER = "postgres"
+DB_PASSWORD = "Friday@3840011655"
 # =========================
 # Auth (single shared pwd)
 # =========================
@@ -96,12 +103,56 @@ with st.sidebar:
 # =========================
 # DB layer (Supabase-ready)
 # =========================
+# at top of file
+import os
+import urllib.parse
+
+
+def _build_url_from_parts() -> str | None:
+    """
+    Prefer putting these in Streamlit secrets. Fallback to env vars.
+      DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+    Returns a safe SQLAlchemy URL or None if not enough parts are present.
+    """
+    host = st.secrets.get("DB_HOST", os.getenv("DB_HOST", "")).strip()
+    name = st.secrets.get("DB_NAME", os.getenv("DB_NAME", "")).strip()
+    user = st.secrets.get("DB_USER", os.getenv("DB_USER", "")).strip()
+    pwd  = st.secrets.get("DB_PASSWORD", os.getenv("DB_PASSWORD", "")).strip()
+    port = st.secrets.get("DB_PORT", os.getenv("DB_PORT", "5432")).strip()
+
+    if not (host and name and user and pwd):
+        return None
+
+    # URL-encode user & password so special chars like @, :, / are safe
+    user_q = urllib.parse.quote_plus(user)
+    pwd_q  = urllib.parse.quote_plus(pwd)
+
+    return f"postgresql+psycopg://{user_q}:{pwd_q}@{host}:{port}/{name}?sslmode=require"
+
 def get_engine() -> Engine:
-    # Use Supabase Postgres if DATABASE_URL is set; else SQLite fallback
-    url = "postgresql://postgres:Friday@3840011655@db.wwhvgbgrsoztycglktix.supabase.co:5432/postgres".strip()
+    """
+    Priority:
+      1) Full DATABASE_URL in secrets or env (already a complete SQLAlchemy URL)
+      2) Construct from parts (DB_HOST/DB_NAME/DB_USER/DB_PASSWORD/DB_PORT)
+      3) Fallback to local SQLite
+    """
+    # Try a full URL first
+    url = (st.secrets.get("DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+
+    # If you accidentally pasted a psycopg2-style URL, normalize scheme
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    # If no full URL, build from parts
+    if not url:
+        url = _build_url_from_parts() or ""
+
     if url:
         return create_engine(url, pool_pre_ping=True, future=True)
+
+    # Final fallback for local dev
     return create_engine(f"sqlite:///{DB_PATH.as_posix()}", future=True)
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entries (
