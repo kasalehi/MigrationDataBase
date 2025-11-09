@@ -1,10 +1,12 @@
 # streamlit_pbi_table_migration_planner.py
 # -------------------------------------------------
-# Power BI table migration planner with Supabase Postgres (durable) backend.
-# - Two statuses only: "In Progress" (default) / "Completed"
-# - Duplicate prevention & cleanup by old_table only (case/space-insensitive)
-# - SQLite fallback for local dev; CSV mirror with atomic writes
-# - Password gate; T-SQL generation; inline status editing; row deletes
+# Plan & track moving tables from an OLD SQL Server database to a NEW one.
+# - Two-status workflow: "In Progress" / "Completed" (default = In Progress)
+# - Duplicate prevention & cleanup: ONLY by old_table (case/space-insensitive)
+# - Durable SQLite storage (~/Documents/Database Tables MigrationPlanner)
+# - CSV mirror with atomic writes
+# - T-SQL generation helpers
+# - Single shared password gate
 
 from __future__ import annotations
 from pathlib import Path
@@ -13,27 +15,12 @@ import tempfile
 import shutil
 import uuid
 import os
-import urllib.parse
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from filelock import FileLock
-
-# =========================
-# Hardcoded credentials (as requested)
-# =========================
-APP_PASSWORD = "lesmillsreport"
-# Percent-encoded '@' in password:
-DATABASE_URL = "postgresql+psycopg://postgres:Friday%403840011655@db.wwhvgbgrsoztycglktix.supabase.co:5432/postgres?sslmode=require"
-
-# If you prefer split parts (not required since DATABASE_URL is set)
-DB_HOST = "db.wwhvgbgrsoztycglktix.supabase.co"
-DB_PORT = "5432"
-DB_NAME = "postgres"
-DB_USER = "postgres"
-DB_PASSWORD = "Friday@3840011655"
 
 # =========================
 # App defaults & constants
@@ -50,19 +37,19 @@ NEW_DB_DEFAULT     = "LesMills_Report"
 STATUS_CHOICES  = ["In Progress", "Completed"]
 DEFAULT_STATUS  = "In Progress"
 
-APP_NAME  = "Database Tables MigrationPlanner"
-BASE_DIR  = Path.home() / "Documents" / APP_NAME
+APP_NAME = "Database Tables MigrationPlanner"
+BASE_DIR = Path.home() / "Documents" / APP_NAME
 BASE_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH   = BASE_DIR / "planner.sqlite3"         # local dev fallback
-CSV_PATH  = BASE_DIR / "entries.csv"             # local mirror
+DB_PATH  = BASE_DIR / "planner.sqlite3"
+CSV_PATH = BASE_DIR / "entries.csv"
 LOCK_PATH = str(BASE_DIR / "entries.csv.lock")
 
 # =========================
 # Auth (single shared pwd)
 # =========================
 def _get_app_password() -> str:
-    # Use hardcoded password (as requested)
-    return APP_PASSWORD
+    # Move to st.secrets["APP_PASSWORD"] or env var for production
+    return "lesmillsreport"
 
 def password_gate():
     if st.session_state.get("authed", False):
@@ -82,11 +69,10 @@ def password_gate():
     submitted = st.button("Unlock", type="primary")
 
     if submitted:
-        app_pwd = _get_app_password()
-        if not app_pwd:
-            st.error("APP_PASSWORD is not configured.")
+        if not _get_app_password():
+            st.error("APP_PASSWORD not configured.")
             st.stop()
-        if pwd == app_pwd:
+        if pwd == _get_app_password():
             st.session_state["authed"] = True
             st.session_state["tries"] = 0
             st.rerun()
@@ -109,40 +95,9 @@ with st.sidebar:
             st.rerun()
 
 # =========================
-# DB layer (Supabase-ready)
+# DB layer
 # =========================
-def _build_url_from_parts() -> str | None:
-    host = DB_HOST.strip()
-    name = DB_NAME.strip()
-    user = DB_USER.strip()
-    pwd  = DB_PASSWORD.strip()
-    port = DB_PORT.strip() or "5432"
-    if not (host and name and user and pwd):
-        return None
-    user_q = urllib.parse.quote_plus(user)
-    pwd_q  = urllib.parse.quote_plus(pwd)
-    return f"postgresql+psycopg://{user_q}:{pwd_q}@{host}:{port}/{name}?sslmode=require"
-
 def get_engine() -> Engine:
-    """
-    Priority:
-      1) Full DATABASE_URL hardcoded constant (requested)
-      2) Construct from split parts
-      3) Fallback to local SQLite
-    """
-    url = (DATABASE_URL or "").strip()
-
-    # Accept psycopg2-style and normalize
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-
-    if not url:
-        url = _build_url_from_parts() or ""
-
-    if url:
-        return create_engine(url, pool_pre_ping=True, future=True)
-
-    # Final fallback for local dev
     return create_engine(f"sqlite:///{DB_PATH.as_posix()}", future=True)
 
 SCHEMA_SQL = """
@@ -165,141 +120,94 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 """
 
-def _is_sqlite(conn) -> bool:
-    try:
-        conn.exec_driver_sql("PRAGMA table_info(entries);")
-        return True
-    except Exception:
-        return False
+def dedupe_entries(engine: Engine) -> int:
+    """
+    Keep the earliest row per normalized old_table (LOWER(TRIM(old_table))).
+    Delete all other duplicates regardless of server/db/schema/targets.
+    """
+    sql = text("""
+        DELETE FROM entries
+        WHERE id NOT IN (
+            SELECT id FROM (
+                SELECT e.id
+                FROM entries e
+                JOIN (
+                    SELECT
+                        LOWER(TRIM(old_table)) AS t_norm,
+                        MIN(created_at)        AS min_created
+                    FROM entries
+                    GROUP BY LOWER(TRIM(old_table))
+                ) g
+                  ON LOWER(TRIM(e.old_table)) = g.t_norm
+                 AND e.created_at             = g.min_created
+            )
+        );
+    """)
+    with engine.begin() as conn:
+        before = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+        conn.execute(sql)
+        after = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+    return (before - after)
 
 def ensure_db(engine: Engine) -> None:
-    # 1) Create table if missing
+    # 1) Table
     with engine.begin() as conn:
         conn.exec_driver_sql(SCHEMA_SQL)
 
-    # 2) Ensure status column defaulted
+    # 2) Ensure `status` column populated if DB existed before
     with engine.begin() as conn:
-        if _is_sqlite(conn):
-            cols = conn.exec_driver_sql("PRAGMA table_info(entries);").fetchall()
-            names = [c[1] for c in cols]
-            if "status" not in names:
-                conn.exec_driver_sql("ALTER TABLE entries ADD COLUMN status TEXT;")
-            conn.exec_driver_sql(
-                "UPDATE entries SET status = :dflt WHERE status IS NULL OR TRIM(COALESCE(status,''))='';",
-                {"dflt": DEFAULT_STATUS},
-            )
-        else:
-            cols = conn.exec_driver_sql("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name = 'entries';
-            """).fetchall()
-            names = [c[0] for c in cols]
-            if "status" not in names:
-                conn.exec_driver_sql("ALTER TABLE entries ADD COLUMN status TEXT;")
-            conn.exec_driver_sql(
-                "UPDATE entries SET status = :dflt WHERE status IS NULL OR BTRIM(COALESCE(status,''))='';",
-                {"dflt": DEFAULT_STATUS},
-            )
+        cols = conn.exec_driver_sql("PRAGMA table_info(entries);").fetchall()
+        names = [c[1] for c in cols]
+        if "status" not in names:
+            conn.exec_driver_sql("ALTER TABLE entries ADD COLUMN status TEXT;")
+        conn.exec_driver_sql(
+            "UPDATE entries SET status = :dflt WHERE status IS NULL OR TRIM(status)='';",
+            {"dflt": DEFAULT_STATUS},
+        )
 
     # 3) Dedupe by old_table only
     removed = dedupe_entries(engine)
     if removed:
         st.warning(f"Removed {removed} duplicate row(s) by old_table.")
 
-    # 4) Enforce uniqueness by old_table only
+    # 4) Uniqueness by old_table only (case/space-insensitive)
     with engine.begin() as conn:
-        if _is_sqlite(conn):
-            conn.exec_driver_sql("""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_oldtable
-                ON entries (LOWER(TRIM(old_table)));
-            """)
-        else:
-            conn.exec_driver_sql("""
-                DO $$
-                BEGIN
-                  IF NOT EXISTS (
-                    SELECT 1 FROM pg_indexes WHERE indexname = 'ux_entries_oldtable'
-                  ) THEN
-                    CREATE UNIQUE INDEX ux_entries_oldtable
-                    ON entries (LOWER(BTRIM(old_table)));
-                  END IF;
-                END $$;
-            """)
-
-def dedupe_entries(engine: Engine) -> int:
-    """
-    Keep earliest row per normalized old_table; delete the rest.
-    Works on SQLite & Postgres.
-    """
-    with engine.begin() as conn:
-        is_sqlite = _is_sqlite(conn)
-        before = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
-        if is_sqlite:
-            conn.execute(text("""
-                DELETE FROM entries
-                WHERE id NOT IN (
-                    SELECT id FROM (
-                        SELECT e.id
-                        FROM entries e
-                        JOIN (
-                            SELECT LOWER(TRIM(old_table)) AS t_norm,
-                                   MIN(created_at)        AS min_created
-                            FROM entries
-                            GROUP BY LOWER(TRIM(old_table))
-                        ) g
-                        ON LOWER(TRIM(e.old_table)) = g.t_norm
-                       AND e.created_at             = g.min_created
-                    )
-                );
-            """))
-        else:
-            conn.execute(text("""
-                DELETE FROM entries
-                WHERE id NOT IN (
-                    SELECT id FROM (
-                        SELECT e.id
-                        FROM entries e
-                        JOIN (
-                            SELECT LOWER(BTRIM(old_table)) AS t_norm,
-                                   MIN(created_at)        AS min_created
-                            FROM entries
-                            GROUP BY LOWER(BTRIM(old_table))
-                        ) g
-                        ON LOWER(BTRIM(e.old_table)) = g.t_norm
-                       AND e.created_at               = g.min_created
-                    ) s
-                );
-            """))
-        after = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
-    return (before - after)
+        conn.exec_driver_sql("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_oldtable
+            ON entries (LOWER(TRIM(old_table)));
+        """)
 
 def mapping_exists_by_old_table(engine: Engine, old_table: str) -> bool:
-    q = """
-        SELECT 1 FROM entries
-        WHERE LOWER({trim}(old_table)) = LOWER({trim}(:t))
+    sql = text("""
+        SELECT 1
+        FROM entries
+        WHERE LOWER(TRIM(old_table)) = LOWER(TRIM(:t))
         LIMIT 1
-    """
+    """)
     with engine.begin() as conn:
-        trim = "TRIM" if _is_sqlite(conn) else "BTRIM"
-        sql = text(q.format(trim=trim))
         return conn.execute(sql, {"t": (old_table or "")}).fetchone() is not None
 
 def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
+    """
+    Insert a row; block duplicates by old_table only.
+    Returns (ok, message).
+    """
     row = row.copy()
     now = datetime.utcnow().isoformat(timespec="seconds")
     row.setdefault("id", str(uuid.uuid4()))
     row.setdefault("created_at", now)
     row["updated_at"] = now
 
-    row["old_table"]  = (row.get("old_table") or "").strip()
-    row["new_table"]  = (row.get("new_table") or "").strip()
+    # normalize critical fields
+    row["old_table"] = (row.get("old_table") or "").strip()
     row["old_schema"] = (row.get("old_schema") or DEFAULT_SCHEMA).strip().lower()
     row["new_schema"] = (row.get("new_schema") or DEFAULT_SCHEMA).strip().lower()
-    row["status"]     = (row.get("status") or DEFAULT_STATUS).strip()
+    row["status"] = (row.get("status") or DEFAULT_STATUS).strip()
 
     if not row["dataset_report"] or not row["old_table"] or not row["new_table"]:
         return False, "Dataset/Report, Old table, and New table are required."
 
+    # Block: duplicate by old_table only
     if mapping_exists_by_old_table(engine, row["old_table"]):
         return False, "Duplicate by old_table: an entry for this old_table already exists."
 
@@ -326,6 +234,9 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
         return False, f"Insert failed: {e}"
 
 def update_entry(engine: Engine, row: dict) -> tuple[bool, str]:
+    """
+    Update row fields. Prevent changing to an old_table that already exists on a different id.
+    """
     row = row.copy()
     row["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
     row["old_schema"] = (row.get("old_schema") or DEFAULT_SCHEMA).strip().lower()
@@ -334,16 +245,16 @@ def update_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     row["old_table"]  = (row.get("old_table") or "").strip()
     row["new_table"]  = (row.get("new_table") or "").strip()
 
-    # prevent changing to an existing old_table on a different id
+    # If changing old_table, ensure uniqueness by old_table
     with engine.begin() as conn:
-        trim = "TRIM" if _is_sqlite(conn) else "BTRIM"
         existing = conn.exec_driver_sql(
-            f"""
+            """
             SELECT id FROM entries
-            WHERE LOWER({trim}(old_table)) = LOWER({trim}(:t))
+            WHERE LOWER(TRIM(old_table)) = LOWER(TRIM(:t))
             """,
             {"t": row["old_table"]},
         ).fetchall()
+    # If there's a different id with same old_table, block
     if any(eid[0] != row["id"] for eid in existing):
         return False, "Duplicate by old_table: another row already uses this old_table."
 
@@ -451,41 +362,9 @@ def build_script(row: dict) -> str:
 # =========================
 st.set_page_config(page_title="Table Migration Planner", page_icon="📤", layout="wide")
 st.title("📤 Table Migration Planner")
-st.caption(f"Data folder (local mirror): {BASE_DIR}")
+st.caption(f"Data folder: {BASE_DIR}")
 
 engine = get_engine(); ensure_db(engine)
-
-# --- DB diagnostics (sidebar) ---
-with st.sidebar:
-    st.subheader("DB Diagnostics")
-    try:
-        url_str = engine.url.render_as_string(hide_password=True)
-        st.caption(f"Engine: {url_str}")
-        with engine.begin() as conn:
-            try:
-                dbname = conn.exec_driver_sql("SELECT current_database();").scalar()
-                st.write("current_database:", dbname)
-                found = conn.exec_driver_sql("""
-                    SELECT table_schema, table_name
-                    FROM information_schema.tables
-                    WHERE table_name = 'entries'
-                    ORDER BY 1,2;
-                """).fetchall()
-                if found:
-                    st.success(f"'entries' exists at: {found}")
-                else:
-                    st.warning("No 'entries' table found (yet).")
-            except Exception:
-                st.info("SQLite backend detected")
-                exists = conn.exec_driver_sql(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='entries';"
-                ).fetchone()
-                if exists:
-                    st.success("'entries' exists in SQLite")
-                else:
-                    st.warning("No 'entries' table in SQLite")
-    except Exception as e:
-        st.error(f"Diagnostics error: {e}")
 
 # ---- Add mapping
 with st.expander("➕ Add table move", expanded=True):
@@ -754,18 +633,17 @@ with st.expander("🗑️ Delete rows", expanded=False):
 with st.expander("ℹ️ Notes"):
     st.markdown(
         f"""
-        **Persistence**
-        - Uses the hardcoded Supabase Postgres `DATABASE_URL`. If unreachable, falls back to SQLite (local only).
-        - CSV mirror is written at: `{CSV_PATH}` with atomic writes.
+        **Status tracking**
+        - Only two statuses exist: *In Progress* (default) and *Completed*. You can edit inline and export with Status.
 
-        **Status**
-        - Only two statuses: *In Progress* (default) and *Completed*. You can edit inline and export with Status.
-
-        **Dedup & Uniqueness**
-        - Duplicates are removed/blocked by `old_table` only (case/space-insensitive), regardless of server/db/schema.
+        **Deduplication & Uniqueness**
+        - Duplicates are removed/blocked **only by** `old_table` (case/space-insensitive), regardless of server/db/schema.
 
         **T-SQL generation**
         - *Create+Insert (safe)*: Create empty target via `TOP(0)` then insert. Rebuild PKs/indexes after.
         - *SELECT INTO (quick copy)*: Fast first load; rebuild PKs/indexes after.
+
+        **Durability**
+        - SQLite at `{DB_PATH}` is the source of truth; CSV mirror at `{CSV_PATH}` uses atomic writes.
         """
     )
