@@ -1,6 +1,8 @@
+# there are some libries need to apply 
 streamlit
 pandas 
 sqlalchemy 
 pydantic 
 filelock
 Office365-REST-Python-Client
+psycopg[binary]

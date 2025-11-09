@@ -1,15 +1,10 @@
 # streamlit_pbi_table_migration_planner.py
 # -------------------------------------------------
-# Plan and track moving tables from an OLD SQL Server database
-# to a NEW SQL Server database.
-#
-# - Captures dataset/report + exact OLD→NEW table mapping
-# - One-click T-SQL script generation for copy methods
-# - Durable storage in SQLite (~/Documents/Database Tables MigrationPlanner)
-# - CSV mirror with atomic writes
-# - Duplicate mappings blocked (unique index + pre-check)
-# - Single shared password gate
-# - Delete rows (single or multi) with confirmation
+# Power BI table migration planner with Supabase Postgres (durable) backend.
+# - Two statuses only: "In Progress" (default) / "Completed"
+# - Duplicate prevention & cleanup by old_table only (case/space-insensitive)
+# - SQLite fallback for local dev; CSV mirror with atomic writes
+# - Password gate; T-SQL generation; inline status editing; row deletes
 
 from __future__ import annotations
 from pathlib import Path
@@ -18,6 +13,7 @@ import tempfile
 import shutil
 import uuid
 import os
+import urllib.parse
 
 import pandas as pd
 import streamlit as st
@@ -25,7 +21,23 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from filelock import FileLock
 
-# --- Defaults for your environment ---
+# =========================
+# Hardcoded credentials (as requested)
+# =========================
+APP_PASSWORD = "lesmillsreport"
+# Percent-encoded '@' in password:
+DATABASE_URL = "postgresql+psycopg://postgres:Friday%403840011655@db.wwhvgbgrsoztycglktix.supabase.co:5432/postgres?sslmode=require"
+
+# If you prefer split parts (not required since DATABASE_URL is set)
+DB_HOST = "db.wwhvgbgrsoztycglktix.supabase.co"
+DB_PORT = "5432"
+DB_NAME = "postgres"
+DB_USER = "postgres"
+DB_PASSWORD = "Friday@3840011655"
+
+# =========================
+# App defaults & constants
+# =========================
 SCHEMA_CHOICES     = ["dim", "dbo", "repo", "pbi", "mart"]
 DEFAULT_SCHEMA     = "dbo"
 
@@ -35,10 +47,22 @@ OLD_DB_DEFAULT     = "LesMills_Reporting"
 NEW_SERVER_DEFAULT = r"LMNZLREPORT01\LM_RPT"
 NEW_DB_DEFAULT     = "LesMills_Report"
 
-# -------- Simple password gate (single shared password) --------
+STATUS_CHOICES  = ["In Progress", "Completed"]
+DEFAULT_STATUS  = "In Progress"
+
+APP_NAME  = "Database Tables MigrationPlanner"
+BASE_DIR  = Path.home() / "Documents" / APP_NAME
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH   = BASE_DIR / "planner.sqlite3"         # local dev fallback
+CSV_PATH  = BASE_DIR / "entries.csv"             # local mirror
+LOCK_PATH = str(BASE_DIR / "entries.csv.lock")
+
+# =========================
+# Auth (single shared pwd)
+# =========================
 def _get_app_password() -> str:
-    # For production, move to st.secrets["APP_PASSWORD"] or env var.
-    return "lesmillsreport"
+    # Use hardcoded password (as requested)
+    return APP_PASSWORD
 
 def password_gate():
     if st.session_state.get("authed", False):
@@ -58,10 +82,11 @@ def password_gate():
     submitted = st.button("Unlock", type="primary")
 
     if submitted:
-        if not _get_app_password():
-            st.error("APP_PASSWORD not configured.")
+        app_pwd = _get_app_password()
+        if not app_pwd:
+            st.error("APP_PASSWORD is not configured.")
             st.stop()
-        if pwd == _get_app_password():
+        if pwd == app_pwd:
             st.session_state["authed"] = True
             st.session_state["tries"] = 0
             st.rerun()
@@ -76,7 +101,6 @@ def password_gate():
     st.stop()
 
 password_gate()
-
 with st.sidebar:
     if st.session_state.get("authed"):
         if st.button("Logout"):
@@ -84,138 +108,212 @@ with st.sidebar:
                 st.session_state.pop(k, None)
             st.rerun()
 
-# ---------------- App constants ----------------
-APP_NAME = "Database Tables MigrationPlanner"
-BASE_DIR = Path.home() / "Documents" / APP_NAME
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = BASE_DIR / "planner.sqlite3"
-CSV_PATH = BASE_DIR / "entries.csv"
-LOCK_PATH = str(BASE_DIR / "entries.csv.lock")
+# =========================
+# DB layer (Supabase-ready)
+# =========================
+def _build_url_from_parts() -> str | None:
+    host = DB_HOST.strip()
+    name = DB_NAME.strip()
+    user = DB_USER.strip()
+    pwd  = DB_PASSWORD.strip()
+    port = DB_PORT.strip() or "5432"
+    if not (host and name and user and pwd):
+        return None
+    user_q = urllib.parse.quote_plus(user)
+    pwd_q  = urllib.parse.quote_plus(pwd)
+    return f"postgresql+psycopg://{user_q}:{pwd_q}@{host}:{port}/{name}?sslmode=require"
 
-# ---------------- DB helpers ----------------
 def get_engine() -> Engine:
+    """
+    Priority:
+      1) Full DATABASE_URL hardcoded constant (requested)
+      2) Construct from split parts
+      3) Fallback to local SQLite
+    """
+    url = (DATABASE_URL or "").strip()
+
+    # Accept psycopg2-style and normalize
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    if not url:
+        url = _build_url_from_parts() or ""
+
+    if url:
+        return create_engine(url, pool_pre_ping=True, future=True)
+
+    # Final fallback for local dev
     return create_engine(f"sqlite:///{DB_PATH.as_posix()}", future=True)
 
-# --- schema & integrity helpers ---
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entries (
   id TEXT PRIMARY KEY,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   dataset_report TEXT,
-  old_server TEXT, old_database TEXT, old_schema TEXT, old_table TEXT,
-  new_server TEXT, new_database TEXT, new_schema TEXT, new_table TEXT,
+  old_server   TEXT,
+  old_database TEXT,
+  old_schema   TEXT,
+  old_table    TEXT,
+  new_server   TEXT,
+  new_database TEXT,
+  new_schema   TEXT,
+  new_table    TEXT,
   migration_method TEXT,
-  comment_sql TEXT
+  comment_sql  TEXT,
+  status       TEXT
 );
 """
 
-def dedupe_entries(engine: Engine) -> int:
-    """
-    Remove duplicate mappings, keeping the earliest created row per mapping.
-    Returns number of rows deleted.
-    """
-    sql = text("""
-        DELETE FROM entries
-        WHERE id NOT IN (
-            SELECT id FROM (
-                SELECT id
-                FROM entries e
-                JOIN (
-                    SELECT
-                        old_server, old_database, old_schema, old_table,
-                        new_server, new_database, new_schema, new_table,
-                        MIN(created_at) AS min_created
-                    FROM entries
-                    GROUP BY
-                        old_server, old_database, old_schema, old_table,
-                        new_server, new_database, new_schema, new_table
-                ) g
-                  ON e.old_server  = g.old_server
-                 AND e.old_database= g.old_database
-                 AND e.old_schema  = g.old_schema
-                 AND e.old_table   = g.old_table
-                 AND e.new_server  = g.new_server
-                 AND e.new_database= g.new_database
-                 AND e.new_schema  = g.new_schema
-                 AND e.new_table   = g.new_table
-                 AND e.created_at  = g.min_created
-            )
-        );
-    """)
-    with engine.begin() as conn:
-        before = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
-        conn.execute(sql)
-        after = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
-    return (before - after)
+def _is_sqlite(conn) -> bool:
+    try:
+        conn.exec_driver_sql("PRAGMA table_info(entries);")
+        return True
+    except Exception:
+        return False
 
 def ensure_db(engine: Engine) -> None:
+    # 1) Create table if missing
     with engine.begin() as conn:
         conn.exec_driver_sql(SCHEMA_SQL)
 
-    # 1) Dedupe existing rows before adding unique constraint
+    # 2) Ensure status column defaulted
+    with engine.begin() as conn:
+        if _is_sqlite(conn):
+            cols = conn.exec_driver_sql("PRAGMA table_info(entries);").fetchall()
+            names = [c[1] for c in cols]
+            if "status" not in names:
+                conn.exec_driver_sql("ALTER TABLE entries ADD COLUMN status TEXT;")
+            conn.exec_driver_sql(
+                "UPDATE entries SET status = :dflt WHERE status IS NULL OR TRIM(COALESCE(status,''))='';",
+                {"dflt": DEFAULT_STATUS},
+            )
+        else:
+            cols = conn.exec_driver_sql("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'entries';
+            """).fetchall()
+            names = [c[0] for c in cols]
+            if "status" not in names:
+                conn.exec_driver_sql("ALTER TABLE entries ADD COLUMN status TEXT;")
+            conn.exec_driver_sql(
+                "UPDATE entries SET status = :dflt WHERE status IS NULL OR BTRIM(COALESCE(status,''))='';",
+                {"dflt": DEFAULT_STATUS},
+            )
+
+    # 3) Dedupe by old_table only
     removed = dedupe_entries(engine)
     if removed:
-        st.warning(f"Removed {removed} duplicate mapping(s) found in existing data.")
+        st.warning(f"Removed {removed} duplicate row(s) by old_table.")
 
-    # 2) Add UNIQUE index (prevents future duplicates even under race)
-    try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_mapping
-                ON entries (
-                  old_server, old_database, old_schema, old_table,
-                  new_server, new_database, new_schema, new_table
-                );
-            """)
-    except Exception as e:
-        st.error(f"Failed to create unique index. Reason: {e}")
-
-def mapping_exists(engine: Engine, rec: dict) -> bool:
-    sql = text("""
-        SELECT 1 FROM entries
-        WHERE old_server=:old_server AND old_database=:old_database
-          AND old_schema=:old_schema AND old_table=:old_table
-          AND new_server=:new_server AND new_database=:new_database
-          AND new_schema=:new_schema AND new_table=:new_table
-        LIMIT 1
-    """)
+    # 4) Enforce uniqueness by old_table only
     with engine.begin() as conn:
-        row = conn.execute(sql, rec).fetchone()
-    return row is not None
+        if _is_sqlite(conn):
+            conn.exec_driver_sql("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_oldtable
+                ON entries (LOWER(TRIM(old_table)));
+            """)
+        else:
+            conn.exec_driver_sql("""
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (
+                    SELECT 1 FROM pg_indexes WHERE indexname = 'ux_entries_oldtable'
+                  ) THEN
+                    CREATE UNIQUE INDEX ux_entries_oldtable
+                    ON entries (LOWER(BTRIM(old_table)));
+                  END IF;
+                END $$;
+            """)
+
+def dedupe_entries(engine: Engine) -> int:
+    """
+    Keep earliest row per normalized old_table; delete the rest.
+    Works on SQLite & Postgres.
+    """
+    with engine.begin() as conn:
+        is_sqlite = _is_sqlite(conn)
+        before = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+        if is_sqlite:
+            conn.execute(text("""
+                DELETE FROM entries
+                WHERE id NOT IN (
+                    SELECT id FROM (
+                        SELECT e.id
+                        FROM entries e
+                        JOIN (
+                            SELECT LOWER(TRIM(old_table)) AS t_norm,
+                                   MIN(created_at)        AS min_created
+                            FROM entries
+                            GROUP BY LOWER(TRIM(old_table))
+                        ) g
+                        ON LOWER(TRIM(e.old_table)) = g.t_norm
+                       AND e.created_at             = g.min_created
+                    )
+                );
+            """))
+        else:
+            conn.execute(text("""
+                DELETE FROM entries
+                WHERE id NOT IN (
+                    SELECT id FROM (
+                        SELECT e.id
+                        FROM entries e
+                        JOIN (
+                            SELECT LOWER(BTRIM(old_table)) AS t_norm,
+                                   MIN(created_at)        AS min_created
+                            FROM entries
+                            GROUP BY LOWER(BTRIM(old_table))
+                        ) g
+                        ON LOWER(BTRIM(e.old_table)) = g.t_norm
+                       AND e.created_at               = g.min_created
+                    ) s
+                );
+            """))
+        after = conn.exec_driver_sql("SELECT COUNT(*) FROM entries").scalar()
+    return (before - after)
+
+def mapping_exists_by_old_table(engine: Engine, old_table: str) -> bool:
+    q = """
+        SELECT 1 FROM entries
+        WHERE LOWER({trim}(old_table)) = LOWER({trim}(:t))
+        LIMIT 1
+    """
+    with engine.begin() as conn:
+        trim = "TRIM" if _is_sqlite(conn) else "BTRIM"
+        sql = text(q.format(trim=trim))
+        return conn.execute(sql, {"t": (old_table or "")}).fetchone() is not None
 
 def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
-    """Returns (ok, message). Blocks duplicates."""
     row = row.copy()
     now = datetime.utcnow().isoformat(timespec="seconds")
     row.setdefault("id", str(uuid.uuid4()))
     row.setdefault("created_at", now)
     row["updated_at"] = now
 
-    # Normalize to avoid case/whitespace duplicates
-    row["old_schema"] = (row.get("old_schema") or "").strip().lower()
-    row["new_schema"] = (row.get("new_schema") or "").strip().lower()
-    row["old_server"] = (row.get("old_server") or "").strip()
-    row["new_server"] = (row.get("new_server") or "").strip()
-    row["old_database"] = (row.get("old_database") or "").strip()
-    row["new_database"] = (row.get("new_database") or "").strip()
-    row["old_table"] = (row.get("old_table") or "").strip()
-    row["new_table"] = (row.get("new_table") or "").strip()
+    row["old_table"]  = (row.get("old_table") or "").strip()
+    row["new_table"]  = (row.get("new_table") or "").strip()
+    row["old_schema"] = (row.get("old_schema") or DEFAULT_SCHEMA).strip().lower()
+    row["new_schema"] = (row.get("new_schema") or DEFAULT_SCHEMA).strip().lower()
+    row["status"]     = (row.get("status") or DEFAULT_STATUS).strip()
 
-    if mapping_exists(engine, row):
-        return False, "This OLD→NEW table mapping already exists — not added."
+    if not row["dataset_report"] or not row["old_table"] or not row["new_table"]:
+        return False, "Dataset/Report, Old table, and New table are required."
+
+    if mapping_exists_by_old_table(engine, row["old_table"]):
+        return False, "Duplicate by old_table: an entry for this old_table already exists."
 
     sql = text("""
         INSERT INTO entries (
           id, created_at, updated_at, dataset_report,
           old_server, old_database, old_schema, old_table,
           new_server, new_database, new_schema, new_table,
-          migration_method, comment_sql
+          migration_method, comment_sql, status
         ) VALUES (
           :id, :created_at, :updated_at, :dataset_report,
           :old_server, :old_database, :old_schema, :old_table,
           :new_server, :new_database, :new_schema, :new_table,
-          :migration_method, :comment_sql
+          :migration_method, :comment_sql, :status
         )
     """)
     try:
@@ -223,23 +321,31 @@ def insert_entry(engine: Engine, row: dict) -> tuple[bool, str]:
             conn.execute(sql, row)
         return True, "Saved to plan."
     except Exception as e:
-        msg = str(e)
-        if "ux_entries_mapping" in msg or "UNIQUE" in msg.upper():
-            return False, "This OLD→NEW table mapping already exists — not added."
+        if "ux_entries_oldtable" in str(e) or "UNIQUE" in str(e).upper():
+            return False, "Duplicate by old_table: an entry for this old_table already exists."
         return False, f"Insert failed: {e}"
 
-def update_entry(engine: Engine, row: dict) -> None:
+def update_entry(engine: Engine, row: dict) -> tuple[bool, str]:
     row = row.copy()
     row["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
-    # Normalize on update too
-    row["old_schema"] = (row.get("old_schema") or "").strip().lower()
-    row["new_schema"] = (row.get("new_schema") or "").strip().lower()
-    row["old_server"] = (row.get("old_server") or "").strip()
-    row["new_server"] = (row.get("new_server") or "").strip()
-    row["old_database"] = (row.get("old_database") or "").strip()
-    row["new_database"] = (row.get("new_database") or "").strip()
-    row["old_table"] = (row.get("old_table") or "").strip()
-    row["new_table"] = (row.get("new_table") or "").strip()
+    row["old_schema"] = (row.get("old_schema") or DEFAULT_SCHEMA).strip().lower()
+    row["new_schema"] = (row.get("new_schema") or DEFAULT_SCHEMA).strip().lower()
+    row["status"]     = (row.get("status") or DEFAULT_STATUS).strip()
+    row["old_table"]  = (row.get("old_table") or "").strip()
+    row["new_table"]  = (row.get("new_table") or "").strip()
+
+    # prevent changing to an existing old_table on a different id
+    with engine.begin() as conn:
+        trim = "TRIM" if _is_sqlite(conn) else "BTRIM"
+        existing = conn.exec_driver_sql(
+            f"""
+            SELECT id FROM entries
+            WHERE LOWER({trim}(old_table)) = LOWER({trim}(:t))
+            """,
+            {"t": row["old_table"]},
+        ).fetchall()
+    if any(eid[0] != row["id"] for eid in existing):
+        return False, "Duplicate by old_table: another row already uses this old_table."
 
     sql = text("""
         UPDATE entries SET
@@ -248,17 +354,17 @@ def update_entry(engine: Engine, row: dict) -> None:
           old_server=:old_server, old_database=:old_database, old_schema=:old_schema, old_table=:old_table,
           new_server=:new_server, new_database=:new_database, new_schema=:new_schema, new_table=:new_table,
           migration_method=:migration_method,
-          comment_sql=:comment_sql
+          comment_sql=:comment_sql,
+          status=:status
         WHERE id=:id
     """)
     with engine.begin() as conn:
         conn.execute(sql, row)
+    return True, "Updated."
 
 def delete_entries(engine: Engine, ids: list[str]) -> int:
-    """Delete rows by id. Returns number deleted."""
     if not ids:
         return 0
-    # Use executemany-style parameters
     sql = text("DELETE FROM entries WHERE id = :id")
     with engine.begin() as conn:
         for _id in ids:
@@ -269,7 +375,9 @@ def fetch_df(engine: Engine) -> pd.DataFrame:
     with engine.begin() as conn:
         return pd.read_sql_query("SELECT * FROM entries ORDER BY created_at DESC", conn)
 
-# --------------- CSV export (durable) ---------------
+# =========================
+# CSV durable mirror
+# =========================
 def atomic_write_csv(df: pd.DataFrame, csv_path: Path, lock_path: str) -> None:
     lock = FileLock(lock_path)
     with lock:
@@ -279,7 +387,9 @@ def atomic_write_csv(df: pd.DataFrame, csv_path: Path, lock_path: str) -> None:
         shutil.move(str(tmp_file), str(csv_path))
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-# --------------- Script generator ---------------
+# =========================
+# T-SQL script generator
+# =========================
 MIGRATION_METHODS = [
     "Create+Insert (safe)",
     "SELECT INTO (quick copy)",
@@ -336,12 +446,48 @@ def build_script(row: dict) -> str:
         return make_tsql_select_into(*args)
     return make_tsql_create_insert(*args)
 
-# ---------------- UI ----------------
+# =========================
+# UI
+# =========================
 st.set_page_config(page_title="Table Migration Planner", page_icon="📤", layout="wide")
 st.title("📤 Table Migration Planner")
-st.caption(f"Data folder: {BASE_DIR}")
+st.caption(f"Data folder (local mirror): {BASE_DIR}")
+
 engine = get_engine(); ensure_db(engine)
 
+# --- DB diagnostics (sidebar) ---
+with st.sidebar:
+    st.subheader("DB Diagnostics")
+    try:
+        url_str = engine.url.render_as_string(hide_password=True)
+        st.caption(f"Engine: {url_str}")
+        with engine.begin() as conn:
+            try:
+                dbname = conn.exec_driver_sql("SELECT current_database();").scalar()
+                st.write("current_database:", dbname)
+                found = conn.exec_driver_sql("""
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    WHERE table_name = 'entries'
+                    ORDER BY 1,2;
+                """).fetchall()
+                if found:
+                    st.success(f"'entries' exists at: {found}")
+                else:
+                    st.warning("No 'entries' table found (yet).")
+            except Exception:
+                st.info("SQLite backend detected")
+                exists = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='entries';"
+                ).fetchone()
+                if exists:
+                    st.success("'entries' exists in SQLite")
+                else:
+                    st.warning("No 'entries' table in SQLite")
+    except Exception as e:
+        st.error(f"Diagnostics error: {e}")
+
+# ---- Add mapping
 with st.expander("➕ Add table move", expanded=True):
     with st.form("new_row"):
         dataset_report = st.text_input("Dataset/Report name *", placeholder="e.g., Customer (Service)")
@@ -350,28 +496,24 @@ with st.expander("➕ Add table move", expanded=True):
         o1,o2,o3,o4 = st.columns(4)
         old_server = o1.text_input("Old server", value=OLD_SERVER_DEFAULT)
         old_db     = o2.text_input("Old database", value=OLD_DB_DEFAULT)
-        old_schema = o3.selectbox(
-            "Old schema", SCHEMA_CHOICES,
-            index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in SCHEMA_CHOICES else 0,
-        )
+        old_schema = o3.selectbox("Old schema", SCHEMA_CHOICES,
+                                  index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA))
         old_table  = o4.text_input("Old table *", placeholder="Customer")
 
         st.markdown("**New (target)**")
         n1,n2,n3,n4 = st.columns(4)
         new_server = n1.text_input("New server", value=NEW_SERVER_DEFAULT)
         new_db     = n2.text_input("New database", value=NEW_DB_DEFAULT)
-        new_schema = n3.selectbox(
-            "New schema", SCHEMA_CHOICES,
-            index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in SCHEMA_CHOICES else 0,
-        )
+        new_schema = n3.selectbox("New schema", SCHEMA_CHOICES,
+                                  index=SCHEMA_CHOICES.index(DEFAULT_SCHEMA))
         new_table  = n4.text_input("New table *", placeholder="Customer")
 
         migration_method = st.radio("Migration method", MIGRATION_METHODS, horizontal=True)
         comment_sql = st.text_area("Notes / extra SQL (optional)", height=140)
+        status_val  = st.selectbox("Status", STATUS_CHOICES, index=STATUS_CHOICES.index(DEFAULT_STATUS))
 
         submitted = st.form_submit_button("Add to plan")
         if submitted:
-            # Normalize before duplicate check
             rec = dict(
                 dataset_report=dataset_report.strip(),
                 old_server=old_server.strip(),
@@ -384,69 +526,148 @@ with st.expander("➕ Add table move", expanded=True):
                 new_table=new_table.strip(),
                 migration_method=migration_method,
                 comment_sql=comment_sql.strip(),
+                status=status_val.strip(),
             )
-            if not rec["dataset_report"] or not rec["old_table"] or not rec["new_table"]:
-                st.error("Dataset/Report, Old table, and New table are required.")
+            ok, msg = insert_entry(engine, rec)
+            if ok:
+                df = fetch_df(engine); atomic_write_csv(df, CSV_PATH, LOCK_PATH)
+                st.success("Saved to plan and mirrored to CSV.")
             else:
-                ok, msg = insert_entry(engine, rec)
-                if ok:
-                    df = fetch_df(engine)
-                    atomic_write_csv(df, CSV_PATH, LOCK_PATH)
-                    st.success("Saved to plan and mirrored to CSV.")
-                else:
-                    st.warning(msg)
+                st.warning(msg)
 
 st.divider()
 
-df = fetch_df(engine)
+# ---- Filter, inline status edit, export
+def normalize_status_values(df: pd.DataFrame) -> pd.DataFrame:
+    if "status" not in df.columns:
+        df["status"] = DEFAULT_STATUS
+        return df
+    df["status"] = df["status"].fillna("").astype(str).str.strip()
+    df.loc[~df["status"].isin(STATUS_CHOICES), "status"] = DEFAULT_STATUS
+    return df
 
-with st.expander("🔎 Filter, view, export", expanded=True):
-    f1,f2 = st.columns(2)
+with st.expander("🔎 Filter, edit status inline, export", expanded=True):
+    raw = fetch_df(engine).copy()
+    view = normalize_status_values(raw)
+
+    f1, f2, f3 = st.columns(3)
     f_ds  = f1.text_input("Dataset/Report contains")
     f_tbl = f2.text_input("Table contains (old/new)")
+    f_st  = f3.multiselect("Status", STATUS_CHOICES, default=[])
 
-    view = df.copy()
-    if f_ds: view = view[view["dataset_report"].str.contains(f_ds, case=False, na=False)]
+    if f_ds:
+        view = view[view["dataset_report"].str.contains(f_ds, case=False, na=False)]
     if f_tbl:
         mask = (
             view["old_table"].str.contains(f_tbl, case=False, na=False) |
             view["new_table"].str.contains(f_tbl, case=False, na=False)
         )
         view = view[mask]
+    if f_st:
+        view = view[view["status"].isin(f_st)]
 
-    st.dataframe(view, use_container_width=True)
-    if st.button("⬇️ Export filtered view to CSV"):
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        st.download_button(
-            "Download now",
-            data=view.to_csv(index=False),
-            file_name=f"PBI_TableMigration_{ts}.csv",
-            mime="text/csv"
-        )
+    preferred_order = [
+        "status",
+        "dataset_report",
+        "old_server","old_database","old_schema","old_table",
+        "new_server","new_database","new_schema","new_table",
+        "migration_method",
+        "comment_sql",
+        "created_at","updated_at","id",
+    ]
+    cols_in_view = [c for c in preferred_order if c in view.columns] + \
+                   [c for c in view.columns if c not in preferred_order]
+    view = view[cols_in_view].reset_index(drop=True)
+
+    st.caption("Edit statuses directly in the grid, then click **Save edits** to persist.")
+    edited = st.data_editor(
+        view,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "status": st.column_config.SelectboxColumn(
+                "Status",
+                options=STATUS_CHOICES,
+                help="Only two options are allowed.",
+                width="small",
+                required=True,
+                default=DEFAULT_STATUS,
+            )
+        },
+        disabled=[
+            "dataset_report","old_server","old_database","old_schema","old_table",
+            "new_server","new_database","new_schema","new_table",
+            "migration_method","comment_sql","created_at","updated_at","id"
+        ],
+        hide_index=True,
+        key="edit_view",
+    )
+
+    if st.button("💾 Save edits"):
+        try:
+            edited = normalize_status_values(edited)
+            changes = edited[["id","status"]].merge(
+                raw[["id","status"]], on="id", how="left", suffixes=("_new","_old")
+            )
+            to_update = changes[changes["status_new"] != changes["status_old"]][["id","status_new"]]
+            if not to_update.empty:
+                with engine.begin() as conn:
+                    for _id, _st in to_update.itertuples(index=False, name=None):
+                        conn.execute(
+                            text("UPDATE entries SET status=:s, updated_at=:u WHERE id=:i"),
+                            {"s": _st, "u": datetime.utcnow().isoformat(timespec="seconds"), "i": _id},
+                        )
+                df2 = fetch_df(engine); atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                st.success(f"Saved {len(to_update)} status change(s) and updated CSV.")
+                st.rerun()
+            else:
+                st.info("No changes to save.")
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+    if not edited.empty:
+        counts = edited["status"].value_counts().reindex(STATUS_CHOICES, fill_value=0)
+        cA, cB = st.columns(2)
+        cA.metric("In Progress", int(counts.get("In Progress", 0)))
+        cB.metric("Completed",   int(counts.get("Completed", 0)))
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "⬇️ Download filtered CSV (includes Status)",
+        data=edited.to_csv(index=False),
+        file_name=f"PBI_TableMigration_{ts}.csv",
+        mime="text/csv"
+    )
 
 st.divider()
 
+# ---- Generate T-SQL for a selected row
+df_all = fetch_df(engine)
 with st.expander("🧰 Generate T-SQL for a selected row", expanded=False):
-    if df.empty:
+    if df_all.empty:
         st.info("No rows yet.")
     else:
-        df["label"] = df.apply(
-            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}",
+        df_all = df_all.copy()
+        df_all["label"] = df_all.apply(
+            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  [{r.get('status','')}]",
             axis=1
         )
-        choice = st.selectbox("Pick an item", df["label"].tolist())
-        row = df.loc[df["label"]==choice].iloc[0].to_dict()
+        choice = st.selectbox("Pick an item", df_all["label"].tolist())
+        row = df_all.loc[df_all["label"]==choice].iloc[0].to_dict()
         script = build_script(row)
         st.code(script, language="sql")
         st.download_button("Download .sql", data=script, file_name=f"migrate_{row['new_schema']}_{row['new_table']}.sql")
 
 st.divider()
 
-with st.expander("✏️ Update notes / mapping", expanded=False):
+# ---- Update mapping / notes + single delete
+with st.expander("✏️ Update mapping / notes", expanded=False):
+    df = fetch_df(engine)
     if df.empty:
         st.info("No rows yet.")
     else:
-        df["label2"] = df.apply(lambda r: f"{r['dataset_report']} → {r['new_schema']}.{r['new_table']}", axis=1)
+        df["label2"] = df.apply(lambda r: f"{r['dataset_report']} → {r['new_schema']}.{r['new_table']}  [{r.get('status','')}]",
+                                axis=1)
         pick = st.selectbox("Choose row", df["label2"].tolist())
         rid = df.loc[df["label2"]==pick, "id"].iloc[0]
         rec = df.loc[df["id"]==rid].iloc[0].to_dict()
@@ -455,8 +676,7 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
         rec["old_server"]   = cA.text_input("Old server", value=rec["old_server"])
         rec["old_database"] = cB.text_input("Old database", value=rec["old_database"])
         rec["old_schema"]   = cC.selectbox(
-            "Old schema",
-            SCHEMA_CHOICES,
+            "Old schema", SCHEMA_CHOICES,
             index=SCHEMA_CHOICES.index(rec.get("old_schema", DEFAULT_SCHEMA))
                 if rec.get("old_schema", DEFAULT_SCHEMA) in SCHEMA_CHOICES else 0,
             key=f"old_schema_{rid}",
@@ -467,82 +687,52 @@ with st.expander("✏️ Update notes / mapping", expanded=False):
         rec["new_server"]   = dA.text_input("New server", value=rec["new_server"])
         rec["new_database"] = dB.text_input("New database", value=rec["new_database"])
         rec["new_schema"]   = dC.selectbox(
-            "New schema",
-            SCHEMA_CHOICES,
+            "New schema", SCHEMA_CHOICES,
             index=SCHEMA_CHOICES.index(rec.get("new_schema", DEFAULT_SCHEMA))
                 if rec.get("new_schema", DEFAULT_SCHEMA) in SCHEMA_CHOICES else 0,
             key=f"new_schema_{rid}",
         )
         rec["new_table"]    = dD.text_input("New table", value=rec["new_table"])
 
-        rec["dataset_report"] = st.text_input("Dataset/Report", value=rec["dataset_report"])
+        rec["dataset_report"]   = st.text_input("Dataset/Report", value=rec["dataset_report"])
         rec["migration_method"] = st.radio(
             "Migration method", MIGRATION_METHODS,
             index=MIGRATION_METHODS.index(rec.get("migration_method") or MIGRATION_METHODS[0]),
             horizontal=True
         )
+        rec["status"] = st.selectbox("Status", STATUS_CHOICES,
+                                     index=STATUS_CHOICES.index(rec.get("status", DEFAULT_STATUS)))
         new_notes = st.text_area("Notes / SQL", value=rec.get("comment_sql") or "", height=160)
 
         c1, c2 = st.columns([1,1])
-        save_clicked = c1.button("💾 Save changes")
-        del_clicked  = c2.button("🗑️ Delete this row")
-
-        if save_clicked:
+        if c1.button("💾 Save changes"):
             rec["comment_sql"] = new_notes
+            ok, msg = update_entry(engine, rec)
+            if ok:
+                df2 = fetch_df(engine); atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                st.success("Updated and mirrored to CSV.")
+                st.rerun()
+            else:
+                st.warning(msg)
 
-            # Normalize to avoid case/space duplicates
-            rec["old_schema"] = (rec["old_schema"] or "").strip().lower()
-            rec["new_schema"] = (rec["new_schema"] or "").strip().lower()
-            rec["old_server"] = (rec["old_server"] or "").strip()
-            rec["new_server"] = (rec["new_server"] or "").strip()
-            rec["old_database"] = (rec["old_database"] or "").strip()
-            rec["new_database"] = (rec["new_database"] or "").strip()
-            rec["old_table"] = (rec["old_table"] or "").strip()
-            rec["new_table"] = (rec["new_table"] or "").strip()
-
-            # Prevent updates that would create a duplicate mapping (different id)
-            existing = df[
-                (df["old_server"]==rec["old_server"]) &
-                (df["old_database"]==rec["old_database"]) &
-                (df["old_schema"]==rec["old_schema"]) &
-                (df["old_table"]==rec["old_table"]) &
-                (df["new_server"]==rec["new_server"]) &
-                (df["new_database"]==rec["new_database"]) &
-                (df["new_schema"]==rec["new_schema"]) &
-                (df["new_table"]==rec["new_table"])
-            ]
-            if not existing.empty and existing.iloc[0]["id"] != rid:
-                st.warning("This OLD→NEW table mapping already exists — not updated.")
-                st.stop()
-
-            update_entry(engine, rec)
-            df2 = fetch_df(engine)
-            atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
-            st.success("Updated and mirrored to CSV.")
-            st.rerun()
-
-        if del_clicked:
-            with st.modal("Confirm delete"):
-                st.write("This will delete the selected row from the plan and CSV.")
-                confirm = st.checkbox("Yes, delete this row permanently")
-                go = st.button("Delete now", type="primary")
-                cancel = st.button("Cancel")
-                if go and confirm:
-                    delete_entries(engine, [rid])
-                    df2 = fetch_df(engine)
-                    atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
-                    st.success("Row deleted and CSV updated.")
-                    st.rerun()
+        if c2.button("🗑️ Delete this row"):
+            confirm = st.checkbox("Yes, delete this row permanently", key=f"confirm_del_{rid}")
+            if confirm and st.button("Delete now", type="primary", key=f"del_now_{rid}"):
+                delete_entries(engine, [rid])
+                df2 = fetch_df(engine); atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                st.success("Row deleted and CSV updated.")
+                st.rerun()
 
 st.divider()
 
-# -------- NEW: Multi-delete tool --------
+# ---- Multi-delete
 with st.expander("🗑️ Delete rows", expanded=False):
+    df = fetch_df(engine)
     if df.empty:
         st.info("No rows to delete.")
     else:
         df["label_del"] = df.apply(
-            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  (id={r['id'][:8]}…)",
+            lambda r: f"{r['dataset_report']} | {r['old_database']}.{r['old_schema']}.{r['old_table']} → {r['new_database']}.{r['new_schema']}.{r['new_table']}  [{r.get('status','')}]  (id={r['id'][:8]}…)",
             axis=1
         )
         to_delete_labels = st.multiselect("Select one or more rows to delete", df["label_del"].tolist())
@@ -556,22 +746,26 @@ with st.expander("🗑️ Delete rows", expanded=False):
                 st.warning("Please tick the confirmation checkbox first.")
             else:
                 n = delete_entries(engine, ids_to_delete)
-                df2 = fetch_df(engine)
-                atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
+                df2 = fetch_df(engine); atomic_write_csv(df2, CSV_PATH, LOCK_PATH)
                 st.success(f"Deleted {n} row(s) and updated CSV.")
                 st.rerun()
 
+# ---- Notes
 with st.expander("ℹ️ Notes"):
     st.markdown(
         f"""
+        **Persistence**
+        - Uses the hardcoded Supabase Postgres `DATABASE_URL`. If unreachable, falls back to SQLite (local only).
+        - CSV mirror is written at: `{CSV_PATH}` with atomic writes.
+
+        **Status**
+        - Only two statuses: *In Progress* (default) and *Completed*. You can edit inline and export with Status.
+
+        **Dedup & Uniqueness**
+        - Duplicates are removed/blocked by `old_table` only (case/space-insensitive), regardless of server/db/schema.
+
         **T-SQL generation**
-        - *Create+Insert (safe)* builds empty target via `TOP(0)` and inserts rows; recreate PKs/indexes after.
-        - *SELECT INTO (quick copy)* fastest first load; recreate PKs/indexes after.
-
-        **Switch-over**
-        - After validating on NEW, point your Power BI dataset to the new server/db and refresh.
-
-        **Durability**
-        - SQLite at `{DB_PATH}` is the point of truth; CSV mirror at `{CSV_PATH}` uses atomic writes.
+        - *Create+Insert (safe)*: Create empty target via `TOP(0)` then insert. Rebuild PKs/indexes after.
+        - *SELECT INTO (quick copy)*: Fast first load; rebuild PKs/indexes after.
         """
     )
