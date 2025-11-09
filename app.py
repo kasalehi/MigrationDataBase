@@ -13,12 +13,27 @@ import tempfile
 import shutil
 import uuid
 import os
+import urllib.parse
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from filelock import FileLock
+
+# =========================
+# Hardcoded credentials (as requested)
+# =========================
+APP_PASSWORD = "lesmillsreport"
+# Percent-encoded '@' in password:
+DATABASE_URL = "postgresql+psycopg://postgres:Friday%403840011655@db.wwhvgbgrsoztycglktix.supabase.co:5432/postgres?sslmode=require"
+
+# If you prefer split parts (not required since DATABASE_URL is set)
+DB_HOST = "db.wwhvgbgrsoztycglktix.supabase.co"
+DB_PORT = "5432"
+DB_NAME = "postgres"
+DB_USER = "postgres"
+DB_PASSWORD = "Friday@3840011655"
 
 # =========================
 # App defaults & constants
@@ -41,20 +56,13 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH   = BASE_DIR / "planner.sqlite3"         # local dev fallback
 CSV_PATH  = BASE_DIR / "entries.csv"             # local mirror
 LOCK_PATH = str(BASE_DIR / "entries.csv.lock")
-DATABASE_URL = "postgresql+psycopg://postgres:Friday%403840011655@db.wwhvgbgrsoztycglktix.supabase.co:5432/postgres?sslmode=require"
 
-# OR Option B: parts (safer if your password has special characters)
-DB_HOST = "db.wwhvgbgrsoztycglktix.supabase.co"
-DB_PORT = "5432"
-DB_NAME = "postgres"
-DB_USER = "postgres"
-DB_PASSWORD = "Friday@3840011655"
 # =========================
 # Auth (single shared pwd)
 # =========================
 def _get_app_password() -> str:
-    # For production, set: st.secrets["APP_PASSWORD"] or env var
-    return os.getenv("APP_PASSWORD", "lesmillsreport")
+    # Use hardcoded password (as requested)
+    return APP_PASSWORD
 
 def password_gate():
     if st.session_state.get("authed", False):
@@ -103,47 +111,31 @@ with st.sidebar:
 # =========================
 # DB layer (Supabase-ready)
 # =========================
-# at top of file
-import os
-import urllib.parse
-
-
 def _build_url_from_parts() -> str | None:
-    """
-    Prefer putting these in Streamlit secrets. Fallback to env vars.
-      DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
-    Returns a safe SQLAlchemy URL or None if not enough parts are present.
-    """
-    host = st.secrets.get("DB_HOST", os.getenv("DB_HOST", "")).strip()
-    name = st.secrets.get("DB_NAME", os.getenv("DB_NAME", "")).strip()
-    user = st.secrets.get("DB_USER", os.getenv("DB_USER", "")).strip()
-    pwd  = st.secrets.get("DB_PASSWORD", os.getenv("DB_PASSWORD", "")).strip()
-    port = st.secrets.get("DB_PORT", os.getenv("DB_PORT", "5432")).strip()
-
+    host = DB_HOST.strip()
+    name = DB_NAME.strip()
+    user = DB_USER.strip()
+    pwd  = DB_PASSWORD.strip()
+    port = DB_PORT.strip() or "5432"
     if not (host and name and user and pwd):
         return None
-
-    # URL-encode user & password so special chars like @, :, / are safe
     user_q = urllib.parse.quote_plus(user)
     pwd_q  = urllib.parse.quote_plus(pwd)
-
     return f"postgresql+psycopg://{user_q}:{pwd_q}@{host}:{port}/{name}?sslmode=require"
 
 def get_engine() -> Engine:
     """
     Priority:
-      1) Full DATABASE_URL in secrets or env (already a complete SQLAlchemy URL)
-      2) Construct from parts (DB_HOST/DB_NAME/DB_USER/DB_PASSWORD/DB_PORT)
+      1) Full DATABASE_URL hardcoded constant (requested)
+      2) Construct from split parts
       3) Fallback to local SQLite
     """
-    # Try a full URL first
-    url = (st.secrets.get("DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+    url = (DATABASE_URL or "").strip()
 
-    # If you accidentally pasted a psycopg2-style URL, normalize scheme
+    # Accept psycopg2-style and normalize
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-    # If no full URL, build from parts
     if not url:
         url = _build_url_from_parts() or ""
 
@@ -152,7 +144,6 @@ def get_engine() -> Engine:
 
     # Final fallback for local dev
     return create_engine(f"sqlite:///{DB_PATH.as_posix()}", future=True)
-
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS entries (
@@ -464,6 +455,38 @@ st.caption(f"Data folder (local mirror): {BASE_DIR}")
 
 engine = get_engine(); ensure_db(engine)
 
+# --- DB diagnostics (sidebar) ---
+with st.sidebar:
+    st.subheader("DB Diagnostics")
+    try:
+        url_str = engine.url.render_as_string(hide_password=True)
+        st.caption(f"Engine: {url_str}")
+        with engine.begin() as conn:
+            try:
+                dbname = conn.exec_driver_sql("SELECT current_database();").scalar()
+                st.write("current_database:", dbname)
+                found = conn.exec_driver_sql("""
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    WHERE table_name = 'entries'
+                    ORDER BY 1,2;
+                """).fetchall()
+                if found:
+                    st.success(f"'entries' exists at: {found}")
+                else:
+                    st.warning("No 'entries' table found (yet).")
+            except Exception:
+                st.info("SQLite backend detected")
+                exists = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='entries';"
+                ).fetchone()
+                if exists:
+                    st.success("'entries' exists in SQLite")
+                else:
+                    st.warning("No 'entries' table in SQLite")
+    except Exception as e:
+        st.error(f"Diagnostics error: {e}")
+
 # ---- Add mapping
 with st.expander("➕ Add table move", expanded=True):
     with st.form("new_row"):
@@ -732,7 +755,7 @@ with st.expander("ℹ️ Notes"):
     st.markdown(
         f"""
         **Persistence**
-        - Uses Supabase Postgres via `DATABASE_URL`. If unset (local dev), falls back to SQLite (local only).
+        - Uses the hardcoded Supabase Postgres `DATABASE_URL`. If unreachable, falls back to SQLite (local only).
         - CSV mirror is written at: `{CSV_PATH}` with atomic writes.
 
         **Status**
